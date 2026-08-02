@@ -44,7 +44,27 @@ Application callback / synchronous-style I/O
 - Linux；
 - 支持 C++17 的 GCC/Clang；
 - CMake 3.16 或更高版本；
-- pthread 和 `dl`。
+- 下表列出的系统依赖。
+
+Pulsar **没有依赖 Boost、Muduo、Protobuf、RocksDB 或其他第三方 C++ 库**。
+它的直接依赖均来自 C++ 标准库和 Linux 系统：
+
+| 依赖 | CMake/系统名称 | 用途 |
+| --- | --- | --- |
+| C++ 标准库 | C++17 | 容器、智能指针、函数对象、原子变量和线程辅助类型 |
+| POSIX Threads | `find_package(Threads)`、`Threads::Threads` | Scheduler Worker、线程封装和同步基础设施 |
+| Dynamic Loader | `${CMAKE_DL_LIBS}`，Linux 通常为 `libdl` | 通过 `dlsym` 获取被 Hook 系统调用的原始入口 |
+| Linux libc/API | `ucontext`、epoll、socket、timer、pipe | Fiber 上下文、I/O 多路复用和事件唤醒 |
+
+构建需要 CMake 和 C++17 编译器；运行基准时，CPU 绑定命令 `taskset` 和环境
+采集命令 `lscpu` 来自 `util-linux`，属于可选测试工具。
+
+Ubuntu/WSL 可使用：
+
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake util-linux
+```
 
 项目依赖 Linux epoll、`ucontext`、pthread 和 `dlsym`，不支持 Windows 或
 macOS。以下环境已经实际用于构建和测试：WSL2、GCC 13.3、Release 构建。
