@@ -51,6 +51,10 @@ class FiberMutex : Nonecopyable {
 
   ThreadMutex guard_;
   Fiber::ptr owner_;
+  // Reserve an unlocked mutex for the waiter selected by unlock(). Without
+  // handoff, newly scheduled Fibers can repeatedly barge ahead of an older
+  // RPC waiter and turn sustained load into multi-second tail latency.
+  bool handoff_ = false;
   WaitQueue waiters_;
 };
 

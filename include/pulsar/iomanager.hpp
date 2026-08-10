@@ -18,6 +18,10 @@ struct EventContext {
   Scheduler *scheduler = nullptr;
   Fiber::ptr fiber;
   std::function<void()> cb;
+  // Resume an I/O waiter on the worker that parked it. A stackful Fiber owns
+  // thread-local scheduler state and must not race with its original worker
+  // by being resumed on an arbitrary epoll worker.
+  int thread_id = -1;
 };
 
 class FdContext {

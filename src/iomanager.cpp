@@ -18,6 +18,7 @@ void FdContext::resetEveContext(EventContext &ctx) {
   ctx.scheduler = nullptr;
   ctx.fiber.reset();
   ctx.cb = nullptr;
+  ctx.thread_id = -1;
 }
 // 触发事件（只是将对应的fiber or cb 加入scheduler tasklist）
 void FdContext::triggerEvent(Event event) {
@@ -25,9 +26,9 @@ void FdContext::triggerEvent(Event event) {
   events = (Event)(events & ~event);
   EventContext &ctx = getEveContext(event);
   if (ctx.cb) {
-    ctx.scheduler->scheduler(ctx.cb);
+    ctx.scheduler->scheduler(ctx.cb, ctx.thread_id);
   } else {
-    ctx.scheduler->scheduler(ctx.fiber);
+    ctx.scheduler->scheduler(ctx.fiber, ctx.thread_id);
   }
   resetEveContext(ctx);
   return;
@@ -107,6 +108,7 @@ int IOManager::addEvent(int fd, Event event, std::function<void()> cb) {
   CondPanic(!event_ctx.scheduler && !event_ctx.fiber && !event_ctx.cb, "event_ctx is nullptr");
 
   event_ctx.scheduler = Scheduler::GetThis();
+  event_ctx.thread_id = GetThreadId();
   if (cb) {
     // 设置了回调函数
     event_ctx.cb.swap(cb);

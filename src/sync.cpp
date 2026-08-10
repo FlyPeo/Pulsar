@@ -105,11 +105,13 @@ size_t WaitQueue::wakeAllLocked(int error) {
 int FiberMutex::lock(uint64_t timeout_ms) {
   const uint64_t deadline = timeout_ms == kFiberWaitForever ? 0 : GetElapsedMS() + timeout_ms;
   const Fiber::ptr current = Fiber::GetThis();
+  bool selected_waiter = false;
 
   for (;;) {
     guard_.lock();
-    if (!owner_) {
+    if (!owner_ && (!handoff_ || selected_waiter)) {
       owner_ = current;
+      handoff_ = false;
       guard_.unlock();
       return 0;
     }
@@ -130,13 +132,14 @@ int FiberMutex::lock(uint64_t timeout_ms) {
       remaining = deadline - now;
     }
     if (waiters_.waitLocked(guard_, remaining) != 0) return -1;
+    selected_waiter = true;
   }
 }
 
 int FiberMutex::try_lock() {
   const Fiber::ptr current = Fiber::GetThis();
   ThreadMutex::Lock lock(guard_);
-  if (!owner_) {
+  if (!owner_ && !handoff_) {
     owner_ = current;
     return 0;
   }
@@ -152,7 +155,7 @@ int FiberMutex::unlock() {
     return -1;
   }
   owner_.reset();
-  waiters_.wakeOneLocked();
+  handoff_ = waiters_.wakeOneLocked();
   return 0;
 }
 
