@@ -132,7 +132,13 @@ void Scheduler::run() {
 
     if (task.fiber_) {
       // 开始执行 协程任务
-      task.fiber_->resume();
+      try {
+        task.fiber_->resume();
+      } catch (const std::exception &error) {
+        std::cerr << LOG_HEAD << "fiber callback failed: " << error.what() << std::endl;
+      } catch (...) {
+        std::cerr << LOG_HEAD << "fiber callback failed with unknown exception" << std::endl;
+      }
       // 执行结束
       --activeThreadCnt_;
       task.reset();
@@ -143,7 +149,13 @@ void Scheduler::run() {
         cbFiber.reset(new Fiber(task.cb_));
       }
       task.reset();
-      cbFiber->resume();
+      try {
+        cbFiber->resume();
+      } catch (const std::exception &error) {
+        std::cerr << LOG_HEAD << "callback fiber failed: " << error.what() << std::endl;
+      } catch (...) {
+        std::cerr << LOG_HEAD << "callback fiber failed with unknown exception" << std::endl;
+      }
       --activeThreadCnt_;
       cbFiber.reset();
     } else {

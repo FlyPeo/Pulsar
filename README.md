@@ -1,9 +1,9 @@
 # Pulsar
 
 Pulsar 是一个面向 Linux 的 C++17 用户态有栈协程与 Hook I/O 运行时。
-它使用 `ucontext` 保存 Fiber 上下文，通过 M:N Scheduler 将协程调度到少量
-pthread Worker，并结合 epoll 和定时器，把常见同步阻塞等待转换为协程挂起与
-事件恢复。
+它使用 Boost.Context 的原生 `fcontext` 保存 Fiber 上下文，通过 M:N Scheduler
+将协程调度到少量 pthread Worker，并结合 epoll 和定时器，把常见同步阻塞等待
+转换为协程挂起与事件恢复。
 
 > 本项目与 Apache Pulsar 消息系统无关。
 
@@ -46,15 +46,16 @@ Application callback / synchronous-style I/O
 - CMake 3.16 或更高版本；
 - 下表列出的系统依赖。
 
-Pulsar **没有依赖 Boost、Muduo、Protobuf、RocksDB 或其他第三方 C++ 库**。
-它的直接依赖均来自 C++ 标准库和 Linux 系统：
+Pulsar 不依赖 Muduo、Protobuf 或 RocksDB；Fiber 上下文切换直接依赖
+Boost.Context：
 
 | 依赖 | CMake/系统名称 | 用途 |
 | --- | --- | --- |
 | C++ 标准库 | C++17 | 容器、智能指针、函数对象、原子变量和线程辅助类型 |
+| Boost.Context | `find_package(Boost COMPONENTS context)`、`Boost::context` | Fiber 的原生 `fcontext` 创建与切换 |
 | POSIX Threads | `find_package(Threads)`、`Threads::Threads` | Scheduler Worker、线程封装和同步基础设施 |
 | Dynamic Loader | `${CMAKE_DL_LIBS}`，Linux 通常为 `libdl` | 通过 `dlsym` 获取被 Hook 系统调用的原始入口 |
-| Linux libc/API | `ucontext`、epoll、socket、timer、pipe | Fiber 上下文、I/O 多路复用和事件唤醒 |
+| Linux libc/API | epoll、socket、timer、pipe、mmap/mprotect（可选） | I/O 多路复用、事件唤醒和 guard page |
 
 构建需要 CMake 和 C++17 编译器；运行基准时，CPU 绑定命令 `taskset` 和环境
 采集命令 `lscpu` 来自 `util-linux`，属于可选测试工具。
@@ -63,11 +64,13 @@ Ubuntu/WSL 可使用：
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential cmake util-linux
+sudo apt install -y build-essential cmake util-linux libboost-context-dev
 ```
 
-项目依赖 Linux epoll、`ucontext`、pthread 和 `dlsym`，不支持 Windows 或
-macOS。以下环境已经实际用于构建和测试：WSL2、GCC 13.3、Release 构建。
+项目依赖 Linux epoll、pthread、`dlsym` 和 Boost.Context，不支持 Windows 或
+macOS。默认构建不会定义 `BOOST_USE_UCONTEXT`，公共头还会在该宏出现时直接
+报错，避免生产构建静默回退。以下迁移环境已经实际用于构建和测试：Ubuntu
+22.04/WSL2、GCC 11.4、Boost 1.74、Debug 与 Release。
 
 ### 2.2 获取、构建和测试
 
@@ -85,11 +88,12 @@ ctest --test-dir build --output-on-failure
 ```text
 build/libpulsar.a
 build/pulsar-sync-check
+build/pulsar-fiber-context-check
 build/pulsar-benchmark
 ```
 
-`pulsar-sync-check` 是当前注册到 CTest 的自动正确性测试；性能基准不会自动加入
-CTest，需要显式运行。
+两个 `*-check` 都注册到 CTest：分别覆盖同步原语，以及 Resume/Yield、reset、
+异常边界与调度线程存活；性能基准不会自动加入 CTest，需要显式运行。
 
 ### 2.3 构建选项
 
@@ -97,7 +101,11 @@ CTest，需要显式运行。
 | --- | --- | --- |
 | `PULSAR_BUILD_TESTS` | `ON` | 构建同步正确性测试 |
 | `PULSAR_BUILD_BENCHMARKS` | `ON` | 构建性能与压力基准 |
+| `PULSAR_FIBER_GUARD_PAGES` | `OFF` | 用 `mmap/mprotect` 在 Fiber 栈底加入 guard page |
 | `BUILD_TESTING` | `ON` | 控制 CTest 测试目标 |
+
+默认关闭 guard page 是为了保持迁移前后均使用 128 KiB、malloc/free 栈的公平
+A/B。服务部署更重视栈溢出 fail-fast 时可显式打开；该配置已经通过两项 CTest。
 
 只构建运行时库：
 
@@ -141,8 +149,9 @@ target_link_libraries(your_target PRIVATE Pulsar::pulsar)
 cmake --install build --prefix "$PWD/install"
 ```
 
-当前安装规则会生成 `PulsarTargets.cmake`，但尚未提供完整的
-`PulsarConfig.cmake` 包装文件；因此推荐优先使用 `add_subdirectory`。
+安装规则会生成 `PulsarConfig.cmake`、版本文件与 `PulsarTargets.cmake`；
+下游可以用 `find_package(Pulsar CONFIG REQUIRED)`，配置文件会自动查找
+Threads 与 Boost.Context。
 
 ## 4. 测试与基准
 
@@ -154,8 +163,9 @@ ctest --test-dir build --output-on-failure
 ./build/pulsar-sync-check
 ```
 
-当前自动测试覆盖 Fiber Mutex 的竞争、超时、取消和 Semaphore 唤醒。基准程序
-还会在各场景中检查完成计数、校验和、超时以及 TCP echo 数据一致性。
+自动测试覆盖 Fiber Resume/Yield、结束后 reset、异常隔离、调度线程继续运行，
+以及 Fiber Mutex 的竞争、超时、取消和 Semaphore 唤醒。基准程序还会在各场景
+检查完成计数、校验和、超时以及 TCP echo 数据一致性。
 
 ### 4.2 基准场景
 
@@ -196,14 +206,15 @@ taskset -c 0-3 ./build/pulsar-benchmark \
 
 ### 4.3 参考性能基线
 
-以下结果来自 2026-08-01 的 WSL2、Intel Core Ultra 7 155H、GCC 13.3、
-Release 构建。固定 CPU、多轮运行后报告中位数：
+以下结果来自 2026-08-28 的同机 A/B：WSL2、AMD Ryzen 7 9700X（环境可见
+4 个逻辑 CPU）、Ubuntu 22.04、GCC 11.4、Boost 1.74、Release、默认 128 KiB
+栈。每项预热后运行 5 轮，报告中位数：
 
 | 场景 | 负载 | 中位数 |
 | --- | --- | ---: |
-| Fiber 上下文切换 | 每轮 5,000,000 次 Yield | 173 ns/transfer |
-| 单 Worker callback 调度 | 100,000 task | 1.34 M task/s |
-| Loopback Hook echo | 1,000 连接 × 10 次 × 64 B | 47.2 K request/s，0 失败 |
+| Fiber 上下文切换 | 每轮 5,000,000 次 Yield | 35.453 ns/transfer |
+| 单 Worker callback 调度 | 100,000 task | 3.884 M task/s |
+| Loopback Hook echo | 1,000 连接 × 10 次 × 64 B | 35.111 K request/s，0 失败 |
 
 复现对应负载：
 
@@ -216,9 +227,11 @@ taskset -c 0-1 ./build/pulsar-benchmark \
   --payload-bytes 64 --round-trips 10
 ```
 
-这些数字只代表指定机器和负载，不用于与 Boost.Context、Photon、libco 或 libgo
-做跨机器绝对性能排名。上下文指标包含 Pulsar 状态检查、智能指针和
-`swapcontext` 完整封装路径，并非裸汇编切换成本。
+这些数字只代表指定机器和负载，不用于与 Photon、libco 或 libgo 做跨机器绝对
+性能排名。上下文指标包含 Pulsar 状态检查、句柄移动和完整 Resume/Yield 封装，
+并非裸 `jump_fcontext` 指令成本。完整五轮原始值、迁移前 ucontext 基线、变化
+百分比和已知限制见 StrataKV 文档
+`docs/性能报告/2026-08-28-Boost.Context迁移.md`。
 
 ## 5. 项目结构
 
@@ -236,11 +249,14 @@ Pulsar/
 
 ## 6. 当前边界
 
-- `ucontext` 已退出 POSIX 标准，但在当前目标 Linux/glibc 环境中可用；
+- 默认上下文后端是 Boost.Context/fcontext；当前只验证了 Linux x86_64；
 - 调度采用协作式模型，CPU 密集任务若不主动 Yield 会占用所在 Worker；
 - 默认 Fiber 使用 128 KiB 固定独立栈，大量常驻协程会消耗较多虚拟地址空间；
+- guard page 是可选项，默认关闭；
 - 尚未实现 work stealing、共享栈、io_uring 和常规文件 I/O Hook；
-- 尚未完成长期 soak、完整 Sanitizer 矩阵和跨发行版兼容性验证；
+- GCC ASan 与发行版预编译的 fcontext 在重复切换压力下仍会不稳定；普通与 guard
+  page 测试通过，但不能把当前 ASan 结果当作完整 Fiber 栈覆盖；
+- 尚未完成长期 soak 和跨发行版兼容性验证；
 - API 和 ABI 仍可能变化，不承诺稳定兼容。
 
 ## 7. 许可

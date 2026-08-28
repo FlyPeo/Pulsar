@@ -3,10 +3,13 @@ project(Pulsar VERSION 0.1.0 LANGUAGES CXX)
 
 include(CTest)
 include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 find_package(Threads REQUIRED)
+find_package(Boost 1.61 REQUIRED COMPONENTS context)
 
 option(PULSAR_BUILD_TESTS "Build Pulsar correctness tests" ON)
 option(PULSAR_BUILD_BENCHMARKS "Build Pulsar benchmarks" ON)
+option(PULSAR_FIBER_GUARD_PAGES "Protect Fiber stack overflow with an mmap guard page" OFF)
 
 add_library(pulsar STATIC
     src/fd_manager.cpp
@@ -29,12 +32,20 @@ target_include_directories(pulsar
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include/pulsar
 )
-target_link_libraries(pulsar PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(pulsar PUBLIC Threads::Threads ${CMAKE_DL_LIBS} Boost::context)
+target_compile_definitions(pulsar PUBLIC PULSAR_CONTEXT_BACKEND_BOOST_FCONTEXT=1)
+if(PULSAR_FIBER_GUARD_PAGES)
+    target_compile_definitions(pulsar PRIVATE PULSAR_FIBER_GUARD_PAGES=1)
+endif()
 
 if(BUILD_TESTING AND PULSAR_BUILD_TESTS)
     add_executable(pulsar-sync-check tests/fiber_sync_check.cpp)
     target_link_libraries(pulsar-sync-check PRIVATE Pulsar::pulsar)
     add_test(NAME pulsar-sync-check COMMAND pulsar-sync-check)
+
+    add_executable(pulsar-fiber-context-check tests/fiber_context_check.cpp)
+    target_link_libraries(pulsar-fiber-context-check PRIVATE Pulsar::pulsar)
+    add_test(NAME pulsar-fiber-context-check COMMAND pulsar-fiber-context-check)
 endif()
 
 if(PULSAR_BUILD_BENCHMARKS)
@@ -50,5 +61,20 @@ install(DIRECTORY include/pulsar DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT PulsarTargets
     FILE PulsarTargets.cmake
     NAMESPACE Pulsar::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Pulsar
+)
+configure_package_config_file(
+    cmake/PulsarConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/PulsarConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Pulsar
+)
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/PulsarConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/PulsarConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/PulsarConfigVersion.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Pulsar
 )
