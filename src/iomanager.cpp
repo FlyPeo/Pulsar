@@ -281,6 +281,10 @@ void IOManager::idle() {
       }
     } while (true);
 
+    // epoll_wait has returned, so this Worker is no longer idle: timer and fd
+    // processing below may enqueue pinned continuations required for shutdown.
+    setCurrentWorkerActive(true);
+
     // 收集所有超时定时器，执行回调函数
     std::vector<std::function<void()>> cbs;
     listExpiredCb(cbs);
@@ -350,6 +354,7 @@ void IOManager::idle() {
     Fiber::ptr cur = Fiber::GetThis();
     auto raw_ptr = cur.get();
     cur.reset();
+    setCurrentWorkerActive(false);
     // std::cout << "[IOManager] idle yield..." << std::endl;
     raw_ptr->yield();
   }

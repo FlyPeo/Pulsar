@@ -1,4 +1,7 @@
 #include "scheduler.hpp"
+
+#include <utility>
+
 #include "fiber.hpp"
 #include "hook.hpp"
 
@@ -7,6 +10,8 @@ namespace pulsar {
 static thread_local Scheduler *cur_scheduler = nullptr;
 // 当前线程的调度协程，每个线程一个 (协程级调度器)
 static thread_local Fiber *cur_scheduler_fiber = nullptr;
+// 当前线程在调度器中的 Worker 下标；调度器外部线程使用无效值。
+static thread_local size_t cur_worker_index = std::numeric_limits<size_t>::max();
 
 const std::string LOG_HEAD = "[scheduler] ";
 
@@ -15,6 +20,11 @@ Scheduler::Scheduler(size_t threads, bool use_caller, const std::string &name) {
 
   isUseCaller_ = use_caller;
   name_ = name;
+
+  workerQueues_.reserve(threads);
+  for (size_t i = 0; i < threads; ++i) {
+    workerQueues_.emplace_back(new WorkerQueue);
+  }
 
   // use_caller:是否将当前线程也作为被调度线程
   if (use_caller) {
@@ -32,7 +42,7 @@ Scheduler::Scheduler(size_t threads, bool use_caller, const std::string &name) {
     // 设置当前线程为调度器线程（caller thread）
     cur_scheduler = this;
     // 初始化当前线程的调度协程 （该线程不会被调度器带哦都），调度结束后，返回主协程
-    rootFiber_.reset(new Fiber(std::bind(&Scheduler::run, this), 0, false));
+    rootFiber_.reset(new Fiber(std::bind(&Scheduler::run, this, 0), 0, false));
 #ifndef NDEBUG
     std::cout << LOG_HEAD << "init caller thread's caller fiber success" << std::endl;
 #endif
@@ -40,7 +50,7 @@ Scheduler::Scheduler(size_t threads, bool use_caller, const std::string &name) {
     Thread::SetName(name_);
     cur_scheduler_fiber = rootFiber_.get();
     rootThread_ = GetThreadId();
-    threadIds_.push_back(rootThread_);
+    workerQueues_[0]->threadId.store(rootThread_, std::memory_order_release);
   } else {
     rootThread_ = -1;
   }
@@ -53,8 +63,13 @@ Scheduler::Scheduler(size_t threads, bool use_caller, const std::string &name) {
 Scheduler *Scheduler::GetThis() { return cur_scheduler; }
 Fiber *Scheduler::GetMainFiber() { return cur_scheduler_fiber; }
 void Scheduler::setThis() { cur_scheduler = this; }
+void Scheduler::setCurrentWorkerActive(bool active) {
+  CondPanic(GetThis() == this && cur_worker_index < workerQueues_.size(),
+            "current thread is not a scheduler worker");
+  workerQueues_[cur_worker_index]->active.store(active, std::memory_order_release);
+}
 Scheduler::~Scheduler() {
-  CondPanic(isStopped_, "isstopped is false");
+  CondPanic(isStopped_.load(std::memory_order_acquire), "isstopped is false");
   if (GetThis() == this) {
     cur_scheduler = nullptr;
   }
@@ -67,7 +82,7 @@ void Scheduler::start() {
   std::cout << LOG_HEAD << "scheduler start" << std::endl;
 #endif
   Mutex::Lock lock(mutex_);
-  if (isStopped_) {
+  if (isStopped_.load(std::memory_order_acquire)) {
 #ifndef NDEBUG
     std::cout << "scheduler has stopped" << std::endl;
 #endif
@@ -76,18 +91,102 @@ void Scheduler::start() {
   CondPanic(threadPool_.empty(), "thread pool is not empty");
   threadPool_.resize(threadCnt_);
   for (size_t i = 0; i < threadCnt_; i++) {
-    threadPool_[i].reset(new Thread(std::bind(&Scheduler::run, this), name_ + "_" + std::to_string(i)));
-    threadIds_.push_back(threadPool_[i]->getId());
+    const size_t workerIndex = i + (isUseCaller_ ? 1 : 0);
+    threadPool_[i].reset(
+        new Thread(std::bind(&Scheduler::run, this, workerIndex), name_ + "_" + std::to_string(i)));
   }
 }
 
+size_t Scheduler::findWorkerByThread(int thread) const {
+  if (thread == -1) return kInvalidWorker;
+  for (size_t i = 0; i < workerQueues_.size(); ++i) {
+    if (workerQueues_[i]->threadId.load(std::memory_order_acquire) == thread) return i;
+  }
+  return kInvalidWorker;
+}
+
+bool Scheduler::enqueueTask(SchedulerTask task) {
+  if (!task.fiber_ && !task.cb_) return false;
+
+  size_t workerIndex = kInvalidWorker;
+  if (task.thread_ != -1) {
+    workerIndex = findWorkerByThread(task.thread_);
+  } else if (GetThis() == this && cur_worker_index < workerQueues_.size()) {
+    // Tasks spawned by a Worker stay local; idle Workers steal when needed.
+    workerIndex = cur_worker_index;
+  }
+  if (workerIndex == kInvalidWorker) {
+    workerIndex = nextQueue_.fetch_add(1, std::memory_order_relaxed) % workerQueues_.size();
+  }
+
+  WorkerQueue &queue = *workerQueues_[workerIndex];
+  bool wasEmpty = false;
+  {
+    Mutex::Lock lock(queue.mutex);
+    wasEmpty = queue.tasks.empty();
+    queue.tasks.emplace_back(std::move(task));
+  }
+  return wasEmpty;
+}
+
+bool Scheduler::tryTakeLocal(size_t workerIndex, int threadId, SchedulerTask &task) {
+  WorkerQueue &queue = *workerQueues_[workerIndex];
+  Mutex::Lock lock(queue.mutex);
+  for (auto it = queue.tasks.begin(); it != queue.tasks.end(); ++it) {
+    if (it->thread_ == -1 || it->thread_ == threadId) {
+      task = std::move(*it);
+      queue.tasks.erase(it);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool Scheduler::trySteal(size_t workerIndex, int threadId, SchedulerTask &task) {
+  const size_t workerCount = workerQueues_.size();
+  for (size_t offset = 1; offset < workerCount; ++offset) {
+    const size_t victimIndex = (workerIndex + offset) % workerCount;
+    WorkerQueue &victim = *workerQueues_[victimIndex];
+    Mutex::Lock lock(victim.mutex);
+    for (auto it = victim.tasks.end(); it != victim.tasks.begin();) {
+      --it;
+      // An unpinned task may migrate. A pinned task is only taken by its
+      // owning OS thread, including tasks queued before that Worker registered.
+      if (it->thread_ == -1 || it->thread_ == threadId) {
+        task = std::move(*it);
+        victim.tasks.erase(it);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool Scheduler::tryTakeTask(size_t workerIndex, SchedulerTask &task) {
+  const int threadId = workerQueues_[workerIndex]->threadId.load(std::memory_order_acquire);
+  return tryTakeLocal(workerIndex, threadId, task) || trySteal(workerIndex, threadId, task);
+}
+
+bool Scheduler::hasPendingTasks() {
+  for (const auto &queuePtr : workerQueues_) {
+    WorkerQueue &queue = *queuePtr;
+    Mutex::Lock lock(queue.mutex);
+    if (!queue.tasks.empty()) return true;
+  }
+  return false;
+}
+
 // 调度协程
-void Scheduler::run() {
+void Scheduler::run(size_t workerIndex) {
 #ifndef NDEBUG
   std::cout << LOG_HEAD << "begin run" << std::endl;
 #endif
+  CondPanic(workerIndex < workerQueues_.size(), "worker index out of range");
   set_hook_enable(true);
   setThis();
+  cur_worker_index = workerIndex;
+  WorkerQueue &worker = *workerQueues_[workerIndex];
+  worker.threadId.store(GetThreadId(), std::memory_order_release);
   if (GetThreadId() != rootThread_) {
     // 如果当前线程不是caller线程，则初始化该线程的调度协程
     cur_scheduler_fiber = Fiber::GetThis().get();
@@ -100,37 +199,11 @@ void Scheduler::run() {
   SchedulerTask task;
   while (true) {
     task.reset();
-    // 是否通知其他线程进行任务调度
-    bool tickle_me = false;
-    {
-      Mutex::Lock lock(mutex_);
-      auto it = tasks_.begin();
-      while (it != tasks_.end()) {
-        // 发现已经指定调度线程，但是不是在当前线程进行调度
-        // 需要通知其他线程进行调度，并跳过当前任务
-        if (it->thread_ != -1 && it->thread_ != GetThreadId()) {
-          ++it;
-          tickle_me = true;
-          continue;
-        }
-        CondPanic(it->fiber_ || it->cb_, "task is nullptr");
-        if (it->fiber_) {
-          CondPanic(it->fiber_->getState() == Fiber::READY, "fiber task state error");
-        }
-        // 找到一个可进行任务，准备开始调度，从任务队列取出，活动线程加1
-        task = *it;
-        tasks_.erase(it++);
-        ++activeThreadCnt_;
-        break;
-      }
-      // 当前线程拿出一个任务后，同时任务队列不空，那么告诉其他线程
-      tickle_me |= (it != tasks_.end());
-    }
-    if (tickle_me) {
-      tickle();
-    }
+    worker.active.store(true, std::memory_order_release);
+    const bool hasTask = tryTakeTask(workerIndex, task);
 
-    if (task.fiber_) {
+    if (hasTask && task.fiber_) {
+      CondPanic(task.fiber_->getState() == Fiber::READY, "fiber task state error");
       // 开始执行 协程任务
       try {
         task.fiber_->resume();
@@ -140,9 +213,8 @@ void Scheduler::run() {
         std::cerr << LOG_HEAD << "fiber callback failed with unknown exception" << std::endl;
       }
       // 执行结束
-      --activeThreadCnt_;
       task.reset();
-    } else if (task.cb_) {
+    } else if (hasTask && task.cb_) {
       if (cbFiber) {
         cbFiber->reset(task.cb_);
       } else {
@@ -156,9 +228,12 @@ void Scheduler::run() {
       } catch (...) {
         std::cerr << LOG_HEAD << "callback fiber failed with unknown exception" << std::endl;
       }
-      --activeThreadCnt_;
-      cbFiber.reset();
+      // A completed callback can reuse its stack on this Worker. A callback
+      // that yielded is owned by Hook/Timer/synchronization state and must be
+      // released here so it can later resume through a pinned Fiber task.
+      if (cbFiber->getState() != Fiber::TERM) cbFiber.reset();
     } else {
+      worker.active.store(false, std::memory_order_release);
       // 任务队列为空
       if (idleFiber->getState() == Fiber::TERM) {
 #ifndef NDEBUG
@@ -166,12 +241,17 @@ void Scheduler::run() {
 #endif
         break;
       }
+      // A pipe tickle may wake a Worker that cannot consume a task pinned to
+      // another Worker. Propagate the notification before blocking again.
+      if (hasPendingTasks()) tickle();
       // idle协程不断空轮转
       ++idleThreadCnt_;
       idleFiber->resume();
       --idleThreadCnt_;
     }
   }
+  worker.active.store(false, std::memory_order_release);
+  cur_worker_index = kInvalidWorker;
 #ifndef NDEBUG
   std::cout << "run exit" << std::endl;
 #endif
@@ -184,8 +264,12 @@ void Scheduler::tickle() {
 }
 
 bool Scheduler::stopping() {
-  Mutex::Lock lock(mutex_);
-  return isStopped_ && tasks_.empty() && activeThreadCnt_ == 0;
+  if (!isStopped_.load(std::memory_order_acquire)) return false;
+  if (hasPendingTasks()) return false;
+  for (const auto &queue : workerQueues_) {
+    if (queue->active.load(std::memory_order_acquire)) return false;
+  }
+  return true;
 }
 
 void Scheduler::idle() {
@@ -203,7 +287,7 @@ void Scheduler::stop() {
   if (stopping()) {
     return;
   }
-  isStopped_ = true;
+  isStopped_.store(true, std::memory_order_release);
 
   // stop指令只能由caller线程发起
   if (isUseCaller_) {

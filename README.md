@@ -13,7 +13,7 @@ Pulsar 是一个面向 Linux 的 C++17 用户态有栈协程与 Hook I/O 运行�
 ## 1. 核心能力
 
 - `Fiber`：独立协程栈、生命周期状态以及 Resume/Yield 上下文切换；
-- `Scheduler`：M:N 任务调度，支持 Fiber、回调任务和指定 Worker；
+- `Scheduler`：每 Worker 本地 deque、work stealing、Fiber/回调任务和指定 Worker；
 - `IOManager`：统一管理 epoll READ/WRITE 事件和 `TimerManager`；
 - Hook I/O：覆盖 sleep、connect、accept、read/write、recv/send 等常用调用；
 - 同步原语：`FiberMutex`、`FiberConditionVariable`、`FiberSemaphore`、超时与取消；
@@ -28,6 +28,7 @@ Application callback / synchronous-style I/O
                   |
                   v
        M:N Scheduler / pthread Workers
+       local deque + work stealing
                   |
           +-------+--------+
           |                |
@@ -89,11 +90,13 @@ ctest --test-dir build --output-on-failure
 build/libpulsar.a
 build/pulsar-sync-check
 build/pulsar-fiber-context-check
+build/pulsar-scheduler-work-stealing-check
 build/pulsar-benchmark
 ```
 
-两个 `*-check` 都注册到 CTest：分别覆盖同步原语，以及 Resume/Yield、reset、
-异常边界与调度线程存活；性能基准不会自动加入 CTest，需要显式运行。
+三个 `*-check` 都注册到 CTest：分别覆盖同步原语，Resume/Yield、reset 与异常边界，
+以及本地队列窃取、Worker 亲和和 Callback Fiber 复用；性能基准不会自动加入
+CTest，需要显式运行。
 
 ### 2.3 构建选项
 
@@ -164,8 +167,9 @@ ctest --test-dir build --output-on-failure
 ```
 
 自动测试覆盖 Fiber Resume/Yield、结束后 reset、异常隔离、调度线程继续运行，
-以及 Fiber Mutex 的竞争、超时、取消和 Semaphore 唤醒。基准程序还会在各场景
-检查完成计数、校验和、超时以及 TCP echo 数据一致性。
+本地队列 work stealing、指定 Worker 亲和、Callback Fiber 复用，以及 Fiber
+Mutex 的竞争、超时、取消和 Semaphore 唤醒。基准程序还会在各场景检查完成
+计数、校验和、超时以及 TCP echo 数据一致性。
 
 ### 4.2 基准场景
 
@@ -206,15 +210,16 @@ taskset -c 0-3 ./build/pulsar-benchmark \
 
 ### 4.3 参考性能基线
 
-以下结果来自 2026-08-28 的同机 A/B：WSL2、AMD Ryzen 7 9700X（环境可见
+以下结果来自 2026-08-29 的同机测试：WSL2、AMD Ryzen 7 9700X（环境可见
 4 个逻辑 CPU）、Ubuntu 22.04、GCC 11.4、Boost 1.74、Release、默认 128 KiB
 栈。每项预热后运行 5 轮，报告中位数：
 
 | 场景 | 负载 | 中位数 |
 | --- | --- | ---: |
-| Fiber 上下文切换 | 每轮 5,000,000 次 Yield | 35.453 ns/transfer |
-| 单 Worker callback 调度 | 100,000 task | 3.884 M task/s |
-| Loopback Hook echo | 1,000 连接 × 10 次 × 64 B | 35.111 K request/s，0 失败 |
+| Fiber 上下文切换 | 每轮 5,000,000 次 Yield | 28.543 ns/transfer |
+| 单 Worker callback 调度 | 100,000 task | 5.589 M task/s |
+| 四 Worker callback 调度 | 100,000 task | 16.985 M task/s，3.04× 单 Worker |
+| Loopback Hook echo | 1,000 连接 × 10 次 × 64 B | 56.072 K request/s，0 失败 |
 
 复现对应负载：
 
@@ -229,9 +234,10 @@ taskset -c 0-1 ./build/pulsar-benchmark \
 
 这些数字只代表指定机器和负载，不用于与 Photon、libco 或 libgo 做跨机器绝对
 性能排名。上下文指标包含 Pulsar 状态检查、句柄移动和完整 Resume/Yield 封装，
-并非裸 `jump_fcontext` 指令成本。完整五轮原始值、迁移前 ucontext 基线、变化
-百分比和已知限制见 StrataKV 文档
-`docs/性能报告/2026-08-28-Boost.Context迁移.md`。
+并非裸 `jump_fcontext` 指令成本。Boost.Context 迁移数据见 StrataKV 文档
+`docs/性能报告/2026-08-28-Boost.Context迁移.md`；本地队列/work stealing 的严格
+交错 A/B、perf/futex 数据与已知限制见
+`docs/性能报告/2026-08-29-Pulsar-Work-Stealing调度器.md`。
 
 ## 5. 项目结构
 
@@ -253,7 +259,9 @@ Pulsar/
 - 调度采用协作式模型，CPU 密集任务若不主动 Yield 会占用所在 Worker；
 - 默认 Fiber 使用 128 KiB 固定独立栈，大量常驻协程会消耗较多虚拟地址空间；
 - guard page 是可选项，默认关闭；
-- 尚未实现 work stealing、共享栈、io_uring 和常规文件 I/O Hook；
+- work stealing 使用带 mutex 的每 Worker deque，并线性扫描 victim；它不是无锁
+  队列，也不迁移指定线程或正在运行的 Fiber；
+- 尚未实现共享栈、io_uring 和常规文件 I/O Hook；
 - GCC ASan 与发行版预编译的 fcontext 在重复切换压力下仍会不稳定；普通与 guard
   page 测试通过，但不能把当前 ASan 结果当作完整 Fiber 栈覆盖；
 - 尚未完成长期 soak 和跨发行版兼容性验证；

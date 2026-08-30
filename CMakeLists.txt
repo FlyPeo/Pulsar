@@ -46,6 +46,10 @@ if(BUILD_TESTING AND PULSAR_BUILD_TESTS)
     add_executable(pulsar-fiber-context-check tests/fiber_context_check.cpp)
     target_link_libraries(pulsar-fiber-context-check PRIVATE Pulsar::pulsar)
     add_test(NAME pulsar-fiber-context-check COMMAND pulsar-fiber-context-check)
+
+    add_executable(pulsar-scheduler-work-stealing-check tests/scheduler_work_stealing_check.cpp)
+    target_link_libraries(pulsar-scheduler-work-stealing-check PRIVATE Pulsar::pulsar)
+    add_test(NAME pulsar-scheduler-work-stealing-check COMMAND pulsar-scheduler-work-stealing-check)
 endif()
 
 if(PULSAR_BUILD_BENCHMARKS)
