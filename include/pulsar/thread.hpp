@@ -1,5 +1,5 @@
-#ifndef __SYLAR_THREAD_H_
-#define __SYLAR_THREAD_H_
+#ifndef PULSAR_THREAD_HPP
+#define PULSAR_THREAD_HPP
 
 #include <pthread.h>
 #include <stdint.h>
@@ -40,4 +40,4 @@ class Thread {
 };
 }  // namespace pulsar
 
-#endif
+#endif  // PULSAR_THREAD_HPP

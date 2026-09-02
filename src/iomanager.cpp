@@ -34,7 +34,12 @@ void FdContext::triggerEvent(Event event) {
   return;
 }
 
-IOManager::IOManager(size_t threads, bool use_caller, const std::string &name) : Scheduler(threads, use_caller, name) {
+IOManager::IOManager(size_t threads, bool use_caller, const std::string &name)
+    : IOManager(threads, use_caller, name, SchedulerReuseOptions{}) {}
+
+IOManager::IOManager(size_t threads, bool use_caller, const std::string &name,
+                     SchedulerReuseOptions reuseOptions)
+    : Scheduler(threads, use_caller, name, std::move(reuseOptions)) {
   epfd_ = epoll_create(5000);
   int ret = pipe(tickleFds_);
   CondPanic(ret == 0, "pipe error");
@@ -73,7 +78,6 @@ IOManager::~IOManager() {
 int IOManager::addEvent(int fd, Event event, std::function<void()> cb) {
   FdContext *fd_ctx = nullptr;
   RWMutex::ReadLock lock(mutex_);
-  // TODO：可以使用map代替
   // 找到fd对应的fdCOntext,没有则创建
   if ((int)fdContexts_.size() > fd) {
     fd_ctx = fdContexts_[fd];
@@ -300,7 +304,6 @@ void IOManager::idle() {
       if (event.data.fd == tickleFds_[0]) {
         // pipe管道内数据无意义，只是tickle意义,读完即可
         uint8_t dummy[256];
-        // TODO：ET下阻塞读取可能有问题
         while (read(tickleFds_[0], dummy, sizeof(dummy)) > 0)
           ;
         continue;

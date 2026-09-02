@@ -15,6 +15,20 @@
 #include "utils.hpp"
 
 namespace pulsar {
+struct SchedulerReuseOptions {
+  std::shared_ptr<FiberStackAllocator> stackAllocator;
+  size_t callbackFiberCachePerWorker = 1;
+};
+
+struct SchedulerReuseStats {
+  FiberStackStats stack;
+  uint64_t callbackCacheHits = 0;
+  uint64_t callbackCacheMisses = 0;
+  uint64_t callbackCacheEvictions = 0;
+  uint64_t callbackCachedCount = 0;
+  uint64_t callbackCachedBytes = 0;
+};
+
 // 调度任务
 class SchedulerTask {
  public:
@@ -45,6 +59,7 @@ class Scheduler {
   typedef std::shared_ptr<Scheduler> ptr;
 
   Scheduler(size_t threads = 1, bool use_caller = true, const std::string &name = "Scheduler");
+  Scheduler(size_t threads, bool use_caller, const std::string &name, SchedulerReuseOptions reuseOptions);
   virtual ~Scheduler();
   const std::string &getName() const { return name_; }
   // 获取当前线程调度器
@@ -69,6 +84,7 @@ class Scheduler {
   void start();
   // 停止调度器,等待所有任务结束
   void stop();
+  SchedulerReuseStats getReuseStats() const;
 
  protected:
   // 通知调度器任务到达
@@ -93,6 +109,7 @@ class Scheduler {
   struct alignas(64) WorkerQueue {
     Mutex mutex;
     std::deque<SchedulerTask> tasks;
+    std::vector<Fiber::ptr> callbackFiberCache;
     std::atomic<int> threadId{-1};
     std::atomic<bool> active{false};
   };
@@ -103,6 +120,9 @@ class Scheduler {
   bool trySteal(size_t workerIndex, int threadId, SchedulerTask &task);
   bool hasPendingTasks();
   size_t findWorkerByThread(int thread) const;
+  Fiber::ptr acquireCallbackFiber(size_t workerIndex, std::function<void()> cb);
+  void tryCacheCallbackFiber(size_t workerIndex, Fiber::ptr &fiber) noexcept;
+  void clearCallbackFiberCaches() noexcept;
   void run(size_t workerIndex);
 
   // 调度器名称
@@ -114,6 +134,13 @@ class Scheduler {
   // 每个 Worker 独立的双端队列；外部提交轮询分发，内部提交保持本地性。
   std::vector<std::unique_ptr<WorkerQueue>> workerQueues_;
   std::atomic<size_t> nextQueue_{0};
+  SchedulerReuseOptions reuseOptions_;
+  uint64_t schedulerOwnerId_ = 0;
+  std::atomic<uint64_t> callbackCacheHits_{0};
+  std::atomic<uint64_t> callbackCacheMisses_{0};
+  std::atomic<uint64_t> callbackCacheEvictions_{0};
+  std::atomic<uint64_t> callbackCachedCount_{0};
+  std::atomic<uint64_t> callbackCachedBytes_{0};
   // 工作线程数量（不包含use_caller的主线程）
   size_t threadCnt_ = 0;
   // IDLE线程数

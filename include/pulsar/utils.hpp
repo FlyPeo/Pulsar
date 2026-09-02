@@ -77,8 +77,10 @@ static std::string BacktraceToString(int size, int skip, const std::string &pref
   return ss.str();
 }
 
-// 断言处理
-static void CondPanic(bool condition, std::string err) {
+// Error messages are string literals at the hot call sites. Keep them as
+// non-owning pointers so successful checks never construct or destroy a
+// std::string (and never allocate merely to discard an unused error message).
+static void CondPanic(bool condition, const char *err) {
   if (!condition) {
     std::cout << "[assert by] (" << __FILE__ << ":" << __LINE__ << "),err: " << err << std::endl;
     std::cout << "[backtrace]\n" << BacktraceToString(6, 3, "") << std::endl;

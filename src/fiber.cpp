@@ -1,16 +1,11 @@
 #include "fiber.hpp"
 #include <atomic>
-#include <cstdlib>
 #include <iostream>
 #include <new>
 #include <utility>
 
-#ifdef PULSAR_FIBER_GUARD_PAGES
-#include <sys/mman.h>
-#include <unistd.h>
-#endif
-
 #include "scheduler.hpp"
+#include "stack_allocator.hpp"
 #include "utils.hpp"
 
 namespace pulsar {
@@ -26,40 +21,17 @@ static std::atomic<uint64_t> fiber_count{0};
 // 协程栈默认大小 128 KiB，与迁移前的 ucontext 实现保持一致。
 static constexpr size_t g_fiber_stack_size = 128 * 1024;
 
-class Fiber::StackAllocator {
+class Fiber::ContextStackAllocator {
  public:
-  explicit StackAllocator(Fiber *fiber) noexcept : fiber_(fiber) {}
+  explicit ContextStackAllocator(Fiber *fiber) noexcept : fiber_(fiber) {}
 
   boost::context::stack_context allocate() {
     CondPanic(fiber_ != nullptr, "fiber stack owner is nullptr");
-    if (fiber_->stackAllocation_ == nullptr) {
-#ifdef PULSAR_FIBER_GUARD_PAGES
-      const long pageSize = sysconf(_SC_PAGESIZE);
-      if (pageSize <= 0) throw std::bad_alloc();
-      const size_t guardSize = static_cast<size_t>(pageSize);
-      const size_t allocationSize = fiber_->stackSize_ + guardSize;
-      void *allocation = mmap(nullptr, allocationSize, PROT_READ | PROT_WRITE,
-                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-      if (allocation == MAP_FAILED) throw std::bad_alloc();
-      if (mprotect(allocation, guardSize, PROT_NONE) != 0) {
-        munmap(allocation, allocationSize);
-        throw std::bad_alloc();
-      }
-      fiber_->stackAllocation_ = allocation;
-      fiber_->stackBase_ = static_cast<char *>(allocation) + guardSize;
-      fiber_->stackAllocationSize_ = allocationSize;
-#else
-      void *allocation = std::malloc(fiber_->stackSize_);
-      if (allocation == nullptr) throw std::bad_alloc();
-      fiber_->stackAllocation_ = allocation;
-      fiber_->stackBase_ = allocation;
-      fiber_->stackAllocationSize_ = fiber_->stackSize_;
-#endif
-    }
+    CondPanic(static_cast<bool>(fiber_->stackBlock_), "fiber stack block is empty");
 
     boost::context::stack_context context;
-    context.size = fiber_->stackSize_;
-    context.sp = static_cast<char *>(fiber_->stackBase_) + fiber_->stackSize_;
+    context.size = fiber_->stackBlock_.usableSize;
+    context.sp = fiber_->stackBlock_.stackPointer();
     return context;
   }
 
@@ -102,9 +74,22 @@ uint64_t Fiber::TotalFiberNum() { return fiber_count.load(std::memory_order_rela
 
 // 有参构造，并为新的子协程创建栈空间
 Fiber::Fiber(std::function<void()> cb, size_t stacksize, bool run_inscheduler)
-    : id_(cur_fiber_id++), cb_(std::move(cb)), isRunInScheduler_(run_inscheduler) {
-  stackSize_ = stacksize > 0 ? stacksize : g_fiber_stack_size;
+    : Fiber(std::move(cb), stacksize, run_inscheduler, GetDefaultFiberStackAllocator()) {}
+
+Fiber::Fiber(std::function<void()> cb, size_t stacksize, bool run_inscheduler,
+             std::shared_ptr<FiberStackAllocator> stackAllocator)
+    : id_(cur_fiber_id++),
+      stackAllocator_(stackAllocator ? std::move(stackAllocator) : GetDefaultFiberStackAllocator()),
+      cb_(std::move(cb)),
+      isRunInScheduler_(run_inscheduler) {
+  const size_t requestedStackSize = stacksize > 0 ? stacksize : g_fiber_stack_size;
   try {
+    stackBlock_ = stackAllocator_->acquire(requestedStackSize);
+    if (!stackBlock_ || stackBlock_.stackBase == nullptr ||
+        stackBlock_.usableSize < requestedStackSize) {
+      throw std::bad_alloc();
+    }
+    stackSize_ = stackBlock_.usableSize;
     context_ = CreateContext();
   } catch (...) {
     ReleaseStack();
@@ -118,7 +103,8 @@ Fiber::Fiber(std::function<void()> cb, size_t stacksize, bool run_inscheduler)
 }
 
 boost::context::fiber Fiber::CreateContext() {
-  StackAllocator allocator(this);
+  stackAllocator_->beforeContextCreate(stackBlock_);
+  ContextStackAllocator allocator(this);
   return boost::context::fiber(
       std::allocator_arg, std::move(allocator),
       [this](boost::context::fiber &&caller) mutable {
@@ -187,29 +173,37 @@ void Fiber::MainFunc() {
   SetThis(return_fiber);
 }
 
-// 协程重置。Boost.Context 的 fiber 句柄是 one-shot，结束后创建新上下文。
-// TODO:暂时不允许Ready状态下的重置
+// Reset a terminated Fiber by constructing a fresh one-shot context.
 void Fiber::reset(std::function<void()> cb) {
   CondPanic(!isMainFiber_, "main fiber cannot be reset");
   CondPanic(state_ == TERM, "state isn't TERM");
   CondPanic(!context_, "terminated fiber context should be empty");
+  boost::context::fiber newContext = CreateContext();
   cb_ = std::move(cb);
   exception_ = nullptr;
-  context_ = CreateContext();
+  context_ = std::move(newContext);
   state_ = READY;
 }
 
 void Fiber::ReleaseStack() noexcept {
-#ifdef PULSAR_FIBER_GUARD_PAGES
-  if (stackAllocation_ != nullptr) {
-    munmap(stackAllocation_, stackAllocationSize_);
+  if (stackBlock_) {
+    CondPanic(stackAllocator_ != nullptr, "fiber stack allocator is nullptr");
+    stackAllocator_->release(std::move(stackBlock_));
   }
-#else
-  std::free(stackAllocation_);
-#endif
-  stackAllocation_ = nullptr;
-  stackBase_ = nullptr;
-  stackAllocationSize_ = 0;
+  stackAllocator_.reset();
+  stackSize_ = 0;
+}
+
+void Fiber::MarkSchedulerCallback(uint64_t schedulerOwnerId, size_t originWorker) noexcept {
+  isSchedulerCallback_ = true;
+  schedulerOwnerId_ = schedulerOwnerId;
+  schedulerOriginWorker_ = originWorker;
+}
+
+bool Fiber::IsReusableSchedulerCallback(uint64_t schedulerOwnerId, size_t originWorker) const noexcept {
+  return isSchedulerCallback_ && schedulerOwnerId_ == schedulerOwnerId &&
+         schedulerOriginWorker_ == originWorker && !isMainFiber_ && state_ == TERM && !context_ &&
+         !callerContext_;
 }
 
 Fiber::~Fiber() {

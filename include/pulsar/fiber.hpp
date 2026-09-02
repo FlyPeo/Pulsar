@@ -6,18 +6,24 @@
 #include <atomic>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <stddef.h>
 #include <stdint.h>
 
 #include "utils.hpp"
+#include "stack_allocator.hpp"
 
 #ifdef BOOST_USE_UCONTEXT
 #error "Pulsar requires Boost.Context's native fcontext backend"
 #endif
 
 namespace pulsar {
+class Scheduler;
+
 class Fiber : public std::enable_shared_from_this<Fiber> {
+  friend class Scheduler;
+
  public:
   typedef std::shared_ptr<Fiber> ptr;
   // Fiber状态机
@@ -37,6 +43,8 @@ class Fiber : public std::enable_shared_from_this<Fiber> {
  public:
   // 构造子协程
   Fiber(std::function<void()> cb, size_t stackSz = 0, bool run_in_scheduler = true);
+  Fiber(std::function<void()> cb, size_t stackSz, bool run_in_scheduler,
+        std::shared_ptr<FiberStackAllocator> stackAllocator);
   ~Fiber();
   // 重置协程状态，复用栈空间
   void reset(std::function<void()> cb);
@@ -48,6 +56,7 @@ class Fiber : public std::enable_shared_from_this<Fiber> {
   uint64_t getId() const { return id_; }
   // 获取协程状态
   State getState() const { return state_; }
+  size_t getStackSize() const { return stackSize_; }
 
   // 设置当前正在运行的协程
   static void SetThis(Fiber *f);
@@ -63,25 +72,27 @@ class Fiber : public std::enable_shared_from_this<Fiber> {
   static uint64_t GetCurFiberID();
 
  private:
-  class StackAllocator;
+  class ContextStackAllocator;
 
   // 使用 Boost.Context 创建一个拥有独立栈的可恢复执行上下文。
   boost::context::fiber CreateContext();
   void ReleaseStack() noexcept;
+  void MarkSchedulerCallback(uint64_t schedulerOwnerId, size_t originWorker) noexcept;
+  bool IsReusableSchedulerCallback(uint64_t schedulerOwnerId, size_t originWorker) const noexcept;
 
   // 协程ID
   uint64_t id_ = 0;
   // 协程栈大小
-  uint32_t stackSize_ = 0;
+  size_t stackSize_ = 0;
   // 协程状态
   State state_ = READY;
   // Boost.Context 句柄是 move-only/one-shot：每次 resume 后必须保存返回的新句柄。
   boost::context::fiber context_;
   boost::context::fiber callerContext_;
-  // 栈由 Fiber 持有，Boost.Context 结束一次执行后不释放，reset 可安全复用。
-  void *stackAllocation_ = nullptr;
-  void *stackBase_ = nullptr;
-  size_t stackAllocationSize_ = 0;
+  // 栈块与分配器共享所有权句柄一起保留到 Fiber 析构，reset 只在本块上
+  // 重建 one-shot context，绝不会把仍可观察的 Fiber 栈提前归还池。
+  std::shared_ptr<FiberStackAllocator> stackAllocator_;
+  FiberStackBlock stackBlock_;
   // 协程回调函数
   std::function<void()> cb_;
   // Fiber 入口捕获异常，切回调用者后再抛出，禁止异常跨越 fcontext 边界。
@@ -92,6 +103,9 @@ class Fiber : public std::enable_shared_from_this<Fiber> {
   bool isRunInScheduler_ = false;
   // 主协程没有独立 Boost.Context 栈。
   bool isMainFiber_ = false;
+  bool isSchedulerCallback_ = false;
+  uint64_t schedulerOwnerId_ = 0;
+  size_t schedulerOriginWorker_ = std::numeric_limits<size_t>::max();
 };
 }  // namespace pulsar
 

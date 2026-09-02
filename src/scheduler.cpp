@@ -14,9 +14,19 @@ static thread_local Fiber *cur_scheduler_fiber = nullptr;
 static thread_local size_t cur_worker_index = std::numeric_limits<size_t>::max();
 
 const std::string LOG_HEAD = "[scheduler] ";
+static std::atomic<uint64_t> next_scheduler_owner_id{1};
 
-Scheduler::Scheduler(size_t threads, bool use_caller, const std::string &name) {
+Scheduler::Scheduler(size_t threads, bool use_caller, const std::string &name)
+    : Scheduler(threads, use_caller, name, SchedulerReuseOptions{}) {}
+
+Scheduler::Scheduler(size_t threads, bool use_caller, const std::string &name,
+                     SchedulerReuseOptions reuseOptions)
+    : reuseOptions_(std::move(reuseOptions)),
+      schedulerOwnerId_(next_scheduler_owner_id.fetch_add(1, std::memory_order_relaxed)) {
   CondPanic(threads > 0, "threads <= 0");
+  if (!reuseOptions_.stackAllocator) {
+    reuseOptions_.stackAllocator = GetDefaultFiberStackAllocator();
+  }
 
   isUseCaller_ = use_caller;
   name_ = name;
@@ -24,6 +34,7 @@ Scheduler::Scheduler(size_t threads, bool use_caller, const std::string &name) {
   workerQueues_.reserve(threads);
   for (size_t i = 0; i < threads; ++i) {
     workerQueues_.emplace_back(new WorkerQueue);
+    workerQueues_.back()->callbackFiberCache.reserve(reuseOptions_.callbackFiberCachePerWorker);
   }
 
   // use_caller:是否将当前线程也作为被调度线程
@@ -42,7 +53,8 @@ Scheduler::Scheduler(size_t threads, bool use_caller, const std::string &name) {
     // 设置当前线程为调度器线程（caller thread）
     cur_scheduler = this;
     // 初始化当前线程的调度协程 （该线程不会被调度器带哦都），调度结束后，返回主协程
-    rootFiber_.reset(new Fiber(std::bind(&Scheduler::run, this, 0), 0, false));
+    rootFiber_.reset(
+        new Fiber(std::bind(&Scheduler::run, this, 0), 0, false, reuseOptions_.stackAllocator));
 #ifndef NDEBUG
     std::cout << LOG_HEAD << "init caller thread's caller fiber success" << std::endl;
 #endif
@@ -62,6 +74,16 @@ Scheduler::Scheduler(size_t threads, bool use_caller, const std::string &name) {
 
 Scheduler *Scheduler::GetThis() { return cur_scheduler; }
 Fiber *Scheduler::GetMainFiber() { return cur_scheduler_fiber; }
+SchedulerReuseStats Scheduler::getReuseStats() const {
+  SchedulerReuseStats result;
+  result.stack = reuseOptions_.stackAllocator->stats();
+  result.callbackCacheHits = callbackCacheHits_.load(std::memory_order_relaxed);
+  result.callbackCacheMisses = callbackCacheMisses_.load(std::memory_order_relaxed);
+  result.callbackCacheEvictions = callbackCacheEvictions_.load(std::memory_order_relaxed);
+  result.callbackCachedCount = callbackCachedCount_.load(std::memory_order_relaxed);
+  result.callbackCachedBytes = callbackCachedBytes_.load(std::memory_order_relaxed);
+  return result;
+}
 void Scheduler::setThis() { cur_scheduler = this; }
 void Scheduler::setCurrentWorkerActive(bool active) {
   CondPanic(GetThis() == this && cur_worker_index < workerQueues_.size(),
@@ -176,6 +198,57 @@ bool Scheduler::hasPendingTasks() {
   return false;
 }
 
+Fiber::ptr Scheduler::acquireCallbackFiber(size_t workerIndex, std::function<void()> cb) {
+  WorkerQueue &worker = *workerQueues_[workerIndex];
+  if (!worker.callbackFiberCache.empty()) {
+    Fiber::ptr fiber = std::move(worker.callbackFiberCache.back());
+    worker.callbackFiberCache.pop_back();
+    callbackCacheHits_.fetch_add(1, std::memory_order_relaxed);
+    callbackCachedCount_.fetch_sub(1, std::memory_order_relaxed);
+    callbackCachedBytes_.fetch_sub(fiber->stackBlock_.allocationSize, std::memory_order_relaxed);
+    fiber->reset(std::move(cb));
+    return fiber;
+  }
+
+  callbackCacheMisses_.fetch_add(1, std::memory_order_relaxed);
+  Fiber::ptr fiber(new Fiber(std::move(cb), 0, true, reuseOptions_.stackAllocator));
+  fiber->MarkSchedulerCallback(schedulerOwnerId_, workerIndex);
+  return fiber;
+}
+
+void Scheduler::tryCacheCallbackFiber(size_t workerIndex, Fiber::ptr &fiber) noexcept {
+  if (!fiber || fiber.use_count() != 1 ||
+      !fiber->IsReusableSchedulerCallback(schedulerOwnerId_, workerIndex)) {
+    return;
+  }
+
+  WorkerQueue &worker = *workerQueues_[workerIndex];
+  if (worker.callbackFiberCache.size() >= reuseOptions_.callbackFiberCachePerWorker) {
+    callbackCacheEvictions_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+
+  const uint64_t stackBytes = fiber->stackBlock_.allocationSize;
+  try {
+    worker.callbackFiberCache.push_back(std::move(fiber));
+    callbackCachedCount_.fetch_add(1, std::memory_order_relaxed);
+    callbackCachedBytes_.fetch_add(stackBytes, std::memory_order_relaxed);
+  } catch (...) {
+    callbackCacheEvictions_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void Scheduler::clearCallbackFiberCaches() noexcept {
+  for (const auto &queuePtr : workerQueues_) {
+    WorkerQueue &worker = *queuePtr;
+    for (const Fiber::ptr &fiber : worker.callbackFiberCache) {
+      callbackCachedCount_.fetch_sub(1, std::memory_order_relaxed);
+      callbackCachedBytes_.fetch_sub(fiber->stackBlock_.allocationSize, std::memory_order_relaxed);
+    }
+    worker.callbackFiberCache.clear();
+  }
+}
+
 // 调度协程
 void Scheduler::run(size_t workerIndex) {
 #ifndef NDEBUG
@@ -193,8 +266,8 @@ void Scheduler::run(size_t workerIndex) {
   }
 
   // 创建idle协程
-  Fiber::ptr idleFiber(new Fiber(std::bind(&Scheduler::idle, this)));
-  Fiber::ptr cbFiber;
+  Fiber::ptr idleFiber(
+      new Fiber(std::bind(&Scheduler::idle, this), 0, true, reuseOptions_.stackAllocator));
 
   SchedulerTask task;
   while (true) {
@@ -212,13 +285,21 @@ void Scheduler::run(size_t workerIndex) {
       } catch (...) {
         std::cerr << LOG_HEAD << "fiber callback failed with unknown exception" << std::endl;
       }
+      tryCacheCallbackFiber(workerIndex, task.fiber_);
       // 执行结束
       task.reset();
     } else if (hasTask && task.cb_) {
-      if (cbFiber) {
-        cbFiber->reset(task.cb_);
-      } else {
-        cbFiber.reset(new Fiber(task.cb_));
+      Fiber::ptr cbFiber;
+      try {
+        cbFiber = acquireCallbackFiber(workerIndex, std::move(task.cb_));
+      } catch (const std::exception &error) {
+        std::cerr << LOG_HEAD << "callback fiber creation failed: " << error.what() << std::endl;
+        task.reset();
+        continue;
+      } catch (...) {
+        std::cerr << LOG_HEAD << "callback fiber creation failed with unknown exception" << std::endl;
+        task.reset();
+        continue;
       }
       task.reset();
       try {
@@ -228,10 +309,10 @@ void Scheduler::run(size_t workerIndex) {
       } catch (...) {
         std::cerr << LOG_HEAD << "callback fiber failed with unknown exception" << std::endl;
       }
-      // A completed callback can reuse its stack on this Worker. A callback
-      // that yielded is owned by Hook/Timer/synchronization state and must be
-      // released here so it can later resume through a pinned Fiber task.
-      if (cbFiber->getState() != Fiber::TERM) cbFiber.reset();
+      // A yielded callback remains owned by Hook/Timer/synchronization state.
+      // Only a terminal, unaliased Scheduler callback can enter this Worker's
+      // bounded object cache.
+      tryCacheCallbackFiber(workerIndex, cbFiber);
     } else {
       worker.active.store(false, std::memory_order_release);
       // 任务队列为空
@@ -320,6 +401,7 @@ void Scheduler::stop() {
   for (auto &i : threads) {
     i->join();
   }
+  clearCallbackFiberCaches();
 }
 
 }  // namespace pulsar

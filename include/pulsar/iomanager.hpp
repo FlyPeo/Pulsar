@@ -1,5 +1,5 @@
-#ifndef __SYLAR_IOMANAGER_H__
-#define __SYLAR_IOMANAGER_H__
+#ifndef PULSAR_IOMANAGER_HPP
+#define PULSAR_IOMANAGER_HPP
 
 #include "fcntl.h"
 #include "scheduler.hpp"
@@ -48,6 +48,8 @@ class IOManager : public Scheduler, public TimerManager {
   typedef std::shared_ptr<IOManager> ptr;
 
   IOManager(size_t threads = 1, bool use_caller = true, const std::string &name = "IOManager");
+  IOManager(size_t threads, bool use_caller, const std::string &name,
+            SchedulerReuseOptions reuseOptions);
   ~IOManager();
   // 添加事件
   int addEvent(int fd, Event event, std::function<void()> cb = nullptr);
@@ -82,4 +84,4 @@ class IOManager : public Scheduler, public TimerManager {
 };
 }  // namespace pulsar
 
-#endif
+#endif  // PULSAR_IOMANAGER_HPP

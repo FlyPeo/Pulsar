@@ -17,6 +17,7 @@ add_library(pulsar STATIC
     src/hook.cpp
     src/iomanager.cpp
     src/scheduler.cpp
+    src/stack_allocator.cpp
     src/sync.cpp
     src/thread.cpp
     src/timer.cpp
@@ -39,6 +40,8 @@ if(PULSAR_FIBER_GUARD_PAGES)
 endif()
 
 if(BUILD_TESTING AND PULSAR_BUILD_TESTS)
+    target_compile_definitions(pulsar PRIVATE PULSAR_ENABLE_TEST_HOOKS=1)
+
     add_executable(pulsar-sync-check tests/fiber_sync_check.cpp)
     target_link_libraries(pulsar-sync-check PRIVATE Pulsar::pulsar)
     add_test(NAME pulsar-sync-check COMMAND pulsar-sync-check)
@@ -50,6 +53,15 @@ if(BUILD_TESTING AND PULSAR_BUILD_TESTS)
     add_executable(pulsar-scheduler-work-stealing-check tests/scheduler_work_stealing_check.cpp)
     target_link_libraries(pulsar-scheduler-work-stealing-check PRIVATE Pulsar::pulsar)
     add_test(NAME pulsar-scheduler-work-stealing-check COMMAND pulsar-scheduler-work-stealing-check)
+
+    add_executable(pulsar-stack-pool-check tests/stack_pool_check.cpp)
+    target_compile_definitions(pulsar-stack-pool-check PRIVATE PULSAR_ENABLE_TEST_HOOKS=1)
+    target_link_libraries(pulsar-stack-pool-check PRIVATE Pulsar::pulsar)
+    add_test(NAME pulsar-stack-pool-check COMMAND pulsar-stack-pool-check)
+
+    add_executable(pulsar-scheduler-cache-check tests/scheduler_cache_check.cpp)
+    target_link_libraries(pulsar-scheduler-cache-check PRIVATE Pulsar::pulsar)
+    add_test(NAME pulsar-scheduler-cache-check COMMAND pulsar-scheduler-cache-check)
 endif()
 
 if(PULSAR_BUILD_BENCHMARKS)

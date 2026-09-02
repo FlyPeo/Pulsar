@@ -1,5 +1,5 @@
-#ifndef __SYLAR_NONCOPYABLE_H__
-#define __SYLAR_NONCOPYABLE_H__
+#ifndef PULSAR_NONCOPYABLE_HPP
+#define PULSAR_NONCOPYABLE_HPP
 
 namespace pulsar {
 class Nonecopyable {
@@ -11,4 +11,4 @@ class Nonecopyable {
 };
 }  // namespace pulsar
 
-#endif
+#endif  // PULSAR_NONCOPYABLE_HPP
