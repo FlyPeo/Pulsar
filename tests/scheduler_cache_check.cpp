@@ -106,29 +106,49 @@ int main() {
   }
 
   {
-    pulsar::Scheduler scheduler(1, false, "external-alias-check", ReuseOptions(4));
+    pulsar::StackPoolOptions stackOptions;
+    stackOptions.maxCachedBytes = 8ULL * 1024 * 1024;
+    auto allocator = std::make_shared<pulsar::PooledStackAllocator>(stackOptions);
+    pulsar::SchedulerReuseOptions options;
+    options.stackAllocator = allocator;
+    options.callbackFiberCachePerWorker = 4;
     pulsar::Fiber::ptr escaped;
     uint64_t escapedId = 0;
     uint64_t nextId = 0;
-    std::promise<void> finished;
-    auto ready = finished.get_future();
-    scheduler.scheduler([&]() {
-      escaped = pulsar::Fiber::GetThis();
-      escapedId = escaped->getId();
-    });
-    scheduler.scheduler([&]() {
-      nextId = pulsar::Fiber::GetThis()->getId();
-      finished.set_value();
-    });
-    scheduler.start();
-    if (ready.wait_for(std::chrono::seconds(3)) != std::future_status::ready) {
-      return Fail("external alias case timed out");
+    {
+      pulsar::Scheduler scheduler(1, false, "external-alias-check", options);
+      std::promise<void> finished;
+      auto ready = finished.get_future();
+      scheduler.scheduler([&]() {
+        escaped = pulsar::Fiber::GetThis();
+        escapedId = escaped->getId();
+      });
+      scheduler.scheduler([&]() {
+        nextId = pulsar::Fiber::GetThis()->getId();
+        finished.set_value();
+      });
+      scheduler.start();
+      if (ready.wait_for(std::chrono::seconds(3)) != std::future_status::ready) {
+        scheduler.stop();
+        return Fail("external alias case timed out");
+      }
+      if (!escaped || escaped->getState() != pulsar::Fiber::TERM || escapedId == nextId) {
+        scheduler.stop();
+        return Fail("externally aliased callback Fiber was reused");
+      }
+      scheduler.stop();
+      if (scheduler.getReuseStats().callbackCachedCount != 0) {
+        return Fail("external alias survived stop but callback cache did not drain");
+      }
     }
-    if (!escaped || escaped->getState() != pulsar::Fiber::TERM || escapedId == nextId) {
-      return Fail("externally aliased callback Fiber was reused");
+    if (allocator->stats().checkedOutBytes == 0) {
+      return Fail("allocator did not outlive Scheduler for escaped Fiber");
     }
-    scheduler.stop();
     escaped.reset();
+    if (allocator->stats().checkedOutBytes != 0) {
+      return Fail("escaped Fiber did not return its stack after Scheduler destruction");
+    }
+    allocator->trim(0);
   }
 
   {
@@ -136,6 +156,7 @@ int main() {
     std::promise<void> finished;
     auto ready = finished.get_future();
     std::atomic<int> stage{0};
+    std::atomic<bool> affinityOk{true};
     int beforeThread = -1;
     int afterThread = -2;
     uint64_t yieldedFiberId = 0;
@@ -143,6 +164,11 @@ int main() {
       beforeThread = pulsar::GetThreadId();
       yieldedFiberId = pulsar::Fiber::GetThis()->getId();
       stage.store(1);
+      usleep(2 * 1000);
+      if (pulsar::GetThreadId() != beforeThread ||
+          pulsar::Fiber::GetThis()->getId() != yieldedFiberId) {
+        affinityOk.store(false);
+      }
       usleep(2 * 1000);
       afterThread = pulsar::GetThreadId();
       stage.store(2);
@@ -162,9 +188,35 @@ int main() {
       return Fail("post-yield reuse callback timed out");
     }
     const auto stats = iom.getReuseStats();
-    if (stage.load() != 2 || beforeThread != afterThread || yieldedFiberId != reusedFiberId ||
+    if (stage.load() != 2 || !affinityOk.load() || beforeThread != afterThread ||
+        yieldedFiberId != reusedFiberId ||
         stats.callbackCachedCount < 1) {
       return Fail("yielded callback was not pinned and safely recycled");
+    }
+    iom.stop();
+  }
+
+  {
+    pulsar::IOManager iom(1, false, "cache-full-check", ReuseOptions(1));
+    std::atomic<size_t> completed{0};
+    auto finished = std::make_shared<std::promise<void>>();
+    auto ready = finished->get_future();
+    for (size_t task = 0; task < 4; ++task) {
+      iom.scheduler([&, finished]() {
+        usleep(2 * 1000);
+        if (completed.fetch_add(1) + 1 == 4) finished->set_value();
+      });
+    }
+    if (ready.wait_for(std::chrono::seconds(3)) != std::future_status::ready) {
+      iom.stop();
+      return Fail("full callback cache case timed out");
+    }
+    if (!WaitUntil([&]() {
+          const auto stats = iom.getReuseStats();
+          return stats.callbackCacheEvictions > 0 && stats.callbackCachedCount == 1;
+        })) {
+      iom.stop();
+      return Fail("capacity-one cache did not evict completed callbacks");
     }
     iom.stop();
   }
@@ -204,6 +256,17 @@ int main() {
     }
     scheduler.stop();
     userFiber.reset();
+  }
+
+  {
+    pulsar::Scheduler scheduler(1, true, "root-idle-exclusion-check", ReuseOptions(4));
+    scheduler.start();
+    scheduler.stop();
+    const auto stats = scheduler.getReuseStats();
+    if (stats.callbackCacheHits != 0 || stats.callbackCacheMisses != 0 ||
+        stats.callbackCachedCount != 0) {
+      return Fail("root, idle, or main Fiber entered callback cache accounting");
+    }
   }
 
   std::cout << "correctness=PASS" << std::endl;

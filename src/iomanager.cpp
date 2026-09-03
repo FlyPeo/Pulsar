@@ -91,7 +91,7 @@ int IOManager::addEvent(int fd, Event event, std::function<void()> cb) {
 
   // 同一个fd不允许注册重复事件
   Mutex::Lock ctxLock(fd_ctx->mutex);
-  CondPanic(!(fd_ctx->events & event), "addevent error, fd = " + fd);
+  CondPanic(!(fd_ctx->events & event), "event is already registered for fd");
 
   int op = fd_ctx->events ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
   epoll_event epevent;
@@ -119,7 +119,8 @@ int IOManager::addEvent(int fd, Event event, std::function<void()> cb) {
   } else {
     // 未设置回调函数，则将当前协程设置为回调任务
     event_ctx.fiber = Fiber::GetThis();
-    CondPanic(event_ctx.fiber->getState() == Fiber::RUNNING, "state=" + event_ctx.fiber->getState());
+    CondPanic(event_ctx.fiber->getState() == Fiber::RUNNING,
+              "I/O waiter Fiber is not running");
   }
 #ifndef NDEBUG
   std::cout << "add event success,fd = " << fd << std::endl;
@@ -315,7 +316,6 @@ void IOManager::idle() {
 
       // 错误事件 or 挂起事件(对端关闭)
       if (event.events & (EPOLLERR | EPOLLHUP)) {
-        std::cout << "error events" << std::endl;
         event.events |= (EPOLLIN | EPOLLOUT) & fd_ctx->events;
       }
       // 实际发生的事件类型

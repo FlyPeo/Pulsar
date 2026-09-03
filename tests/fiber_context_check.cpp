@@ -3,6 +3,7 @@
 #include <future>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 #include <pulsar/fiber.hpp>
 #include <pulsar/scheduler.hpp>
@@ -59,16 +60,30 @@ int main() {
     running->resume();
   });
   entered.get_future().wait();
-  bool concurrentResumeRejected = false;
+  std::atomic<size_t> concurrentResumeRejected{0};
   try {
     Fiber::GetThis();
     running->resume();
   } catch (const std::logic_error &) {
-    concurrentResumeRejected = true;
+    concurrentResumeRejected.fetch_add(1);
   }
+  std::vector<std::thread> contenders;
+  for (size_t thread = 0; thread < 4; ++thread) {
+    contenders.emplace_back([&]() {
+      Fiber::GetThis();
+      for (size_t attempt = 0; attempt < 64; ++attempt) {
+        try {
+          running->resume();
+        } catch (const std::logic_error &) {
+          concurrentResumeRejected.fetch_add(1);
+        }
+      }
+    });
+  }
+  for (auto &contender : contenders) contender.join();
   release.store(true, std::memory_order_release);
   owner.join();
-  if (!concurrentResumeRejected || running->getState() != Fiber::TERM) return 7;
+  if (concurrentResumeRejected.load() != 257 || running->getState() != Fiber::TERM) return 7;
 
   return Fiber::TotalFiberNum() == 4 ? 0 : 8;
 }

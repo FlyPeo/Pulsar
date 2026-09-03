@@ -62,6 +62,10 @@ if(BUILD_TESTING AND PULSAR_BUILD_TESTS)
     add_executable(pulsar-scheduler-cache-check tests/scheduler_cache_check.cpp)
     target_link_libraries(pulsar-scheduler-cache-check PRIVATE Pulsar::pulsar)
     add_test(NAME pulsar-scheduler-cache-check COMMAND pulsar-scheduler-cache-check)
+
+    add_executable(pulsar-reuse-integration-check tests/reuse_integration_check.cpp)
+    target_link_libraries(pulsar-reuse-integration-check PRIVATE Pulsar::pulsar)
+    add_test(NAME pulsar-reuse-integration-check COMMAND pulsar-reuse-integration-check)
 endif()
 
 if(PULSAR_BUILD_BENCHMARKS)

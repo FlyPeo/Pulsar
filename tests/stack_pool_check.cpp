@@ -128,6 +128,7 @@ int main(int argc, char **argv) {
     return Fail("pooled allocator statistics are inconsistent");
   }
 
+#ifdef PULSAR_ENABLE_TEST_HOOKS
   pool->trim(0);
   pool->resetStats();
   FiberStackBlock metadataFailure = pool->acquire(128 * 1024);
@@ -139,6 +140,7 @@ int main(int argc, char **argv) {
       poolStats.cachedBytes != 0) {
     return Fail("freelist metadata failure did not fall back to direct release");
   }
+#endif
 
   if (!allocatorOnly) {
     Fiber::GetThis();
