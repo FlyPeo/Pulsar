@@ -146,6 +146,64 @@ int main() {
 Hook 只在 Pulsar Scheduler Worker 中自动启用。在普通线程中调用相同系统调用
 仍保持原生阻塞语义。
 
+### 3.2 协程栈分配器与对象池 (Stack Allocator & Object Cache)
+
+Pulsar 提供分层的协程栈分配管理机制：
+1. **`DirectStackAllocator`**：默认直通分配器，通过 `malloc/free`（或开启 Guard Page 时的 `mmap/munmap`）进行无池化即时分配与释放。
+2. **`PooledStackAllocator`**：线程安全的高性能栈复用池，按 2 的幂次分级管理空闲栈。
+   - **默认容量上限**：`maxCachedBytes = 64 MiB`（67,108,864 字节）。
+   - **最大池化尺寸**：`maxPooledStackSize = 1 MiB`（1,048,576 字节），超过该阈值的超大栈直通底层释放。
+   - **Guard Page 配合**：构建时开启 `-DPULSAR_FIBER_GUARD_PAGES=ON`，分配器使用 `mmap/mprotect` 在栈底设置不可访问保护页，池化释放时重设权限，驱逐与 trim 时通过 `munmap` 彻底归还操作系统。
+   - **主动收缩 (Trim)**：支持 `allocator->trim(targetBytes)` 动态缩容；`trim(0)` 清空全部闲置缓存。
+   - **监控与记账**：通过 `allocator->stats()` 获取完整命中、未命中、借出与缓存字节等细粒度统计。
+
+#### Scheduler / IOManager 注入与每 Worker 多槽配置
+
+```cpp
+#include <pulsar/pulsar.h>
+#include <cassert>
+#include <iostream>
+
+int main() {
+  pulsar::StackPoolOptions poolOpts;
+  poolOpts.maxCachedBytes = 64ULL * 1024 * 1024;    // 默认 64 MiB 上限
+  poolOpts.maxPooledStackSize = 1ULL * 1024 * 1024; // 默认 1 MiB 最大池化尺寸
+  auto allocator = pulsar::MakePooledStackAllocator(poolOpts);
+
+  pulsar::SchedulerReuseOptions schedOpts;
+  schedOpts.stackAllocator = allocator;
+  schedOpts.callbackFiberCachePerWorker = 4; // 每 Worker 对象缓存容量（默认 1，可设为 N）
+
+  {
+    pulsar::IOManager iom(1, false, "example-iom", schedOpts);
+    iom.start();
+    for (int i = 0; i < 10; ++i) {
+      iom.scheduler([] {
+        // 短任务执行
+      });
+    }
+    iom.stop();
+  }
+
+  auto stats = allocator->stats();
+  assert(stats.acquireRequests >= 1);
+  assert(stats.cachedBytes > 0);
+
+  // 主动收缩释放内存
+  allocator->trim(0);
+  assert(allocator->stats().cachedBytes == 0);
+
+  std::cout << "Pulsar stack pool example verified successfully!\n";
+  return 0;
+}
+```
+
+#### 对象复用资格与设计认知
+
+- **对象复用资格 (Qualification)**：调度器内部对象缓存仅回收**由调度器自动创建、执行至 `TERM` 状态、执行上下文为空、完全脱离任何等待源且不存在外部引用（`use_count() == 1`）**的回调 Fiber。用户显式创建的 Fiber 或被外部容器持久引用的 Fiber 绝对不进入缓存。
+- **休眠 Fiber 仍独占栈**：栈池的作用是复用已完工的栈资源以消除创建/销毁的系统调用。处于运行中、等待 I/O 或休眠挂起中的 Fiber 必须独占自身执行栈，栈池**不减少同时在用或休眠协程的常驻内存开销**。
+
+
 作为另一个 CMake 工程的子目录使用：
 
 ```cmake
