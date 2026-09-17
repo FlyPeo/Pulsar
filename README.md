@@ -98,12 +98,16 @@ build/libpulsar.a
 build/pulsar-sync-check
 build/pulsar-fiber-context-check
 build/pulsar-scheduler-work-stealing-check
+build/pulsar-stack-pool-check
+build/pulsar-scheduler-cache-check
+build/pulsar-reuse-integration-check
 build/pulsar-benchmark
 ```
 
-三个 `*-check` 都注册到 CTest：分别覆盖同步原语，Resume/Yield、reset 与异常边界，
-以及本地队列窃取、Worker 亲和和 Callback Fiber 复用；性能基准不会自动加入
-CTest，需要显式运行。
+六个 `*-check` 都注册到 CTest：分别覆盖同步原语；Resume/Yield、reset 与异常边界；
+本地队列窃取、Worker 亲和和 Callback Fiber 复用；栈池尺寸分级/容量/trim/统计；
+回调对象缓存资格与命中；以及 I/O/Timer/WaitQueue 挂起下的复用集成。性能基准
+不会自动加入 CTest，需要显式运行。
 
 ### 2.3 构建选项
 
@@ -175,8 +179,9 @@ int main() {
   schedOpts.callbackFiberCachePerWorker = 4; // 每 Worker 对象缓存容量（默认 1，可设为 N）
 
   {
+    // use_caller=false 时构造函数已内部 start()，无需再显式调用；
+    // IOManager 析构时会 join 全部 Worker 并清空回调 Fiber 缓存。
     pulsar::IOManager iom(1, false, "example-iom", schedOpts);
-    iom.start();
     for (int i = 0; i < 10; ++i) {
       iom.scheduler([] {
         // 短任务执行
@@ -203,6 +208,7 @@ int main() {
 - **对象复用资格 (Qualification)**：调度器内部对象缓存仅回收**由调度器自动创建、执行至 `TERM` 状态、执行上下文为空、完全脱离任何等待源且不存在外部引用（`use_count() == 1`）**的回调 Fiber。用户显式创建的 Fiber 或被外部容器持久引用的 Fiber 绝对不进入缓存。
 - **休眠 Fiber 仍独占栈**：栈池的作用是复用已完工的栈资源以消除创建/销毁的系统调用。处于运行中、等待 I/O 或休眠挂起中的 Fiber 必须独占自身执行栈，栈池**不减少同时在用或休眠协程的常驻内存开销**。
 
+### 3.3 作为子目录/安装目标使用
 
 作为另一个 CMake 工程的子目录使用：
 
@@ -247,14 +253,20 @@ Mutex 的竞争、超时、取消和 Semaphore 唤醒。基准程序还会在各
 | 场景 | 命令示例 | 测量内容 |
 | --- | --- | --- |
 | 上下文切换 | `--case context --iterations 5000000 --cpu 0` | Resume/Yield transfer |
-| 生命周期 | `--case lifecycle --count 10000 --cpu 0` | 创建、首次运行、销毁和内存 |
+| 生命周期 | `--case lifecycle --count 10000 --cpu 0 --mode MODE` | 创建、首次运行、销毁和内存 |
 | 调度 | `--case scheduler --count 100000 --threads 1` | Callback 调度吞吐 |
 | 定时器 | `--case timer --count 10000 --delay-ms 50 --cpu 0` | 插入成本和到期延迟 |
 | Hook sleep | `--case hook-sleep --count 10000 --delay-ms 10 --cpu 0` | 定时挂起与恢复 |
 | Hook TCP echo | `--case hook-echo --count 1000 --round-trips 10` | Loopback socket Hook |
 | 同步压力 | `--case sync --count 1000 --threads 4` | Semaphore 与 Mutex |
+| 波次突发 | `--case wave-burst --rounds 5 --pool-mib 64` | 栈池冷热命中、驱逐与容量上限 |
+| 休眠足迹 | `--case sleep-footprint --count 10000 --pool-mib 64 --mode pool-single` | VmSize/RSS 与 checked-out/cached 字节记账 |
+| 回调 A/B | `--case callback-ab --mode pool-multi --rounds 5 --count 50000` | 单槽/多槽命中与外部别名拒绝 |
 
-示例：固定 CPU 运行上下文切换基准：
+生命周期、波次突发、休眠足迹和回调 A/B 支持 `--mode
+direct-single|pool-single|pool-multi`（默认 `direct-single`，即 Direct 分配器 +
+每 Worker 单槽回调缓存的基线）；`--pool-mib` 设置栈池空闲上限（默认 64 MiB），
+`--fiber-cache-per-worker` 设置回调对象缓存容量。示例：固定 CPU 运行上下文切换基准：
 
 ```bash
 ./build/pulsar-benchmark \
@@ -322,7 +334,9 @@ Pulsar/
 
 - 默认上下文后端是 Boost.Context/fcontext；当前只验证了 Linux x86_64；
 - 调度采用协作式模型，CPU 密集任务若不主动 Yield 会占用所在 Worker；
-- 默认 Fiber 使用 128 KiB 固定独立栈，大量常驻协程会消耗较多虚拟地址空间；
+- 默认 Fiber 使用 128 KiB 固定独立栈，大量常驻/挂起协程会消耗较多虚拟地址
+  空间；可选注入 `PooledStackAllocator` 复用已销毁 Fiber 的空闲栈（见 3.2），
+  但它不减少同时在用或休眠协程的栈；
 - guard page 是可选项，默认关闭；
 - work stealing 使用带 mutex 的每 Worker deque，并线性扫描 victim；它不是无锁
   队列，也不迁移指定线程或正在运行的 Fiber；
