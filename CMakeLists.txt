@@ -9,7 +9,15 @@ find_package(Boost 1.61 REQUIRED COMPONENTS context)
 
 option(PULSAR_BUILD_TESTS "Build Pulsar correctness tests" ON)
 option(PULSAR_BUILD_BENCHMARKS "Build Pulsar benchmarks" ON)
+option(PULSAR_BUILD_NET "Build the optional explicit TCP network module" OFF)
+option(PULSAR_BUILD_RPC "Build the optional Protobuf RPC module" OFF)
+set(PULSAR_LEGACY_INTEROP_BINARY "" CACHE FILEPATH
+    "Optional separately linked StrataKV RPC endpoint for cross-process tests")
 option(PULSAR_FIBER_GUARD_PAGES "Protect Fiber stack overflow with an mmap guard page" OFF)
+
+if(PULSAR_BUILD_RPC)
+    set(PULSAR_BUILD_NET ON)
+endif()
 
 add_library(pulsar STATIC
     src/fd_manager.cpp
@@ -39,6 +47,69 @@ if(PULSAR_FIBER_GUARD_PAGES)
     target_compile_definitions(pulsar PRIVATE PULSAR_FIBER_GUARD_PAGES=1)
 endif()
 
+if(PULSAR_BUILD_NET)
+    add_library(pulsar_net STATIC src/net.cpp)
+    add_library(Pulsar::net ALIAS pulsar_net)
+    target_compile_features(pulsar_net PUBLIC cxx_std_17)
+    target_include_directories(pulsar_net PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    )
+    target_link_libraries(pulsar_net PUBLIC Pulsar::pulsar)
+    set_target_properties(pulsar_net PROPERTIES EXPORT_NAME net)
+    install(TARGETS pulsar_net EXPORT PulsarTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    add_executable(pulsar-tcp-echo examples/tcp_echo.cpp)
+    target_link_libraries(pulsar-tcp-echo PRIVATE Pulsar::net)
+endif()
+
+if(PULSAR_BUILD_RPC)
+    find_package(Protobuf REQUIRED)
+    protobuf_generate_cpp(PULSAR_RPC_PROTO_SOURCES PULSAR_RPC_PROTO_HEADERS
+        proto/pulsar_rpc_header.proto)
+    add_library(pulsar_rpc STATIC
+        src/rpc.cpp
+        ${PULSAR_RPC_PROTO_SOURCES}
+        ${PULSAR_RPC_PROTO_HEADERS}
+    )
+    add_library(Pulsar::rpc ALIAS pulsar_rpc)
+    target_compile_features(pulsar_rpc PUBLIC cxx_std_17)
+    target_include_directories(pulsar_rpc PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    )
+    target_include_directories(pulsar_rpc PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    target_link_libraries(pulsar_rpc PUBLIC Pulsar::net protobuf::libprotobuf)
+    set_target_properties(pulsar_rpc PROPERTIES EXPORT_NAME rpc)
+    install(TARGETS pulsar_rpc EXPORT PulsarTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+    protobuf_generate_cpp(PULSAR_ECHO_PROTO_SOURCES PULSAR_ECHO_PROTO_HEADERS
+        examples/rpc_echo.proto)
+    add_executable(pulsar-rpc-echo
+        examples/rpc_echo.cpp
+        ${PULSAR_ECHO_PROTO_SOURCES}
+        ${PULSAR_ECHO_PROTO_HEADERS}
+    )
+    target_include_directories(pulsar-rpc-echo PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    target_link_libraries(pulsar-rpc-echo PRIVATE Pulsar::rpc)
+    if(BUILD_TESTING AND PULSAR_BUILD_TESTS)
+        add_executable(pulsar-rpc-interop-new
+            tests/interop/new_endpoint.cpp
+            ${PULSAR_ECHO_PROTO_SOURCES}
+            ${PULSAR_ECHO_PROTO_HEADERS}
+        )
+        target_include_directories(pulsar-rpc-interop-new PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+        target_link_libraries(pulsar-rpc-interop-new PRIVATE Pulsar::rpc)
+        if(PULSAR_LEGACY_INTEROP_BINARY)
+            find_package(Python3 COMPONENTS Interpreter REQUIRED)
+            add_test(NAME pulsar-rpc-legacy-interop
+                COMMAND Python3::Interpreter
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/interop/run.py
+                    $<TARGET_FILE:pulsar-rpc-interop-new>
+                    ${PULSAR_LEGACY_INTEROP_BINARY})
+        endif()
+    endif()
+endif()
+
 if(BUILD_TESTING AND PULSAR_BUILD_TESTS)
     target_compile_definitions(pulsar PRIVATE PULSAR_ENABLE_TEST_HOOKS=1)
 
@@ -66,6 +137,23 @@ if(BUILD_TESTING AND PULSAR_BUILD_TESTS)
     add_executable(pulsar-reuse-integration-check tests/reuse_integration_check.cpp)
     target_link_libraries(pulsar-reuse-integration-check PRIVATE Pulsar::pulsar)
     add_test(NAME pulsar-reuse-integration-check COMMAND pulsar-reuse-integration-check)
+
+    if(PULSAR_BUILD_NET)
+        add_executable(pulsar-net-check tests/net_check.cpp)
+        target_link_libraries(pulsar-net-check PRIVATE Pulsar::net)
+        add_test(NAME pulsar-net-check COMMAND pulsar-net-check)
+    endif()
+    if(PULSAR_BUILD_RPC)
+        add_test(NAME pulsar-rpc-echo COMMAND pulsar-rpc-echo)
+        add_executable(pulsar-rpc-fault-check
+            tests/rpc_fault_check.cpp
+            ${PULSAR_ECHO_PROTO_SOURCES}
+            ${PULSAR_ECHO_PROTO_HEADERS}
+        )
+        target_include_directories(pulsar-rpc-fault-check PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+        target_link_libraries(pulsar-rpc-fault-check PRIVATE Pulsar::rpc)
+        add_test(NAME pulsar-rpc-fault-check COMMAND pulsar-rpc-fault-check)
+    endif()
 endif()
 
 if(PULSAR_BUILD_BENCHMARKS)

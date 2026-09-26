@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.16)
+project(pulsar_downstream LANGUAGES CXX)
+
+if(PULSAR_SOURCE_DIR)
+    add_subdirectory("${PULSAR_SOURCE_DIR}" pulsar-source)
+else()
+    find_package(Pulsar CONFIG REQUIRED)
+endif()
+
+add_executable(pulsar-downstream main.cpp)
+target_link_libraries(pulsar-downstream PRIVATE Pulsar::pulsar)
+if(TARGET Pulsar::net)
+    target_link_libraries(pulsar-downstream PRIVATE Pulsar::net)
+    target_compile_definitions(pulsar-downstream PRIVATE PULSAR_HAS_NET=1)
+endif()

@@ -1,0 +1,14 @@
+syntax = "proto2";
+package example;
+option cc_generic_services = true;
+
+message EchoRequest {
+  required bytes text = 1;
+  optional uint32 delay_ms = 2;
+}
+message EchoResponse {
+  required bytes text = 1;
+}
+service EchoService {
+  rpc Echo(EchoRequest) returns (EchoResponse);
+}

@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.16)
+project(pulsar_rpc_external LANGUAGES CXX)
+find_package(Pulsar CONFIG REQUIRED)
+find_package(Protobuf REQUIRED)
+protobuf_generate_cpp(ECHO_SOURCES ECHO_HEADERS rpc_echo.proto)
+add_executable(pulsar-rpc-external rpc_echo.cpp ${ECHO_SOURCES} ${ECHO_HEADERS})
+target_include_directories(pulsar-rpc-external PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(pulsar-rpc-external PRIVATE Pulsar::rpc)

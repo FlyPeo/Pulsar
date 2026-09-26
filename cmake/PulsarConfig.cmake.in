@@ -3,5 +3,8 @@
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
 find_dependency(Boost 1.61 COMPONENTS context)
+if(@PULSAR_BUILD_RPC@)
+    find_dependency(Protobuf)
+endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/PulsarTargets.cmake")

@@ -1,21 +1,36 @@
 # Pulsar
 
-Pulsar 是一个面向 Linux 的 C++17 用户态有栈协程与 Hook I/O 运行时。
+Pulsar 是一个面向 Linux 的 C++17 有栈协程与模块化网络 I/O 库，
+可选配 Protobuf RPC。
 它使用 Boost.Context 的原生 `fcontext` 保存 Fiber 上下文，通过 M:N Scheduler
 将协程调度到少量 pthread Worker，并结合 epoll 和定时器，把常见同步阻塞等待
 转换为协程挂起与事件恢复。
 
 > 本项目与 Apache Pulsar 消息系统无关。
 
-当前版本适合源码学习、运行时实验和本地性能测试，不应直接作为生产级异步
-运行时使用。
+核心运行时适合源码学习、运行时实验和本地性能测试；显式 TCP 与 RPC 模块
+仍处于实验阶段。当前没有长期负载与跨发行版验证，不应直接作为生产级
+网络/RPC 运行时使用。
 
-## 来源说明
+| 模块 | CMake 目标 | 默认 | 当前范围 |
+| --- | --- | --- | --- |
+| Fiber、Scheduler、epoll/Timer、Hook | `Pulsar::pulsar` | 开启 | 已有核心接口 |
+| 显式非阻塞 TCP | `Pulsar::net` | 关闭 | IPv4 TCP、限流、超时与关闭 |
+| Protobuf RPC | `Pulsar::rpc` | 关闭 | 兼容 StrataKV RPC v1 的通用 Service/Channel |
 
-Pulsar 的早期代码保留过来自 Sylar 协程项目的标识，当前仓库在此基础上继续
-进行了 Boost.Context 迁移、Fiber 生命周期处理、per-worker deque/work
-stealing、同步原语和测试基准等改造。准确的上游版本与许可证仍需在再次分发
-衍生代码前完成核对，因此不应把整个运行时描述为从空目录独立实现。
+依赖方向为 `Pulsar::rpc → Pulsar::net → Pulsar::pulsar`。这三个目标是功能分层，
+不表示已经覆盖 PhotonLibOS 的文件 I/O、HTTP/TLS、io_uring 或全部 LibOS 能力。
+
+## 实现贡献与来源
+
+当前版本的主要开发工作包括：
+
+- 将 Fiber 上下文迁移至 Boost.Context `fcontext`，完善生命周期与异常边界；
+- 实现 per-worker deque、work stealing、Worker 亲和与回调 Fiber 复用；
+- 增加协程栈分配与复用、同步原语，以及正确性测试和性能基准。
+
+早期代码保留过 Sylar 协程项目的标识。准确的上游版本与许可证仍需核对；
+在完成核对前，不将整个运行时表述为从零独立实现。
 
 ## 1. 核心能力
 
@@ -115,6 +130,8 @@ build/pulsar-benchmark
 | --- | --- | --- |
 | `PULSAR_BUILD_TESTS` | `ON` | 构建同步正确性测试 |
 | `PULSAR_BUILD_BENCHMARKS` | `ON` | 构建性能与压力基准 |
+| `PULSAR_BUILD_NET` | `OFF` | 构建并导出显式 TCP 目标 `Pulsar::net` |
+| `PULSAR_BUILD_RPC` | `OFF` | 构建并导出 `Pulsar::rpc`，同时开启 net；需要 Protobuf |
 | `PULSAR_FIBER_GUARD_PAGES` | `OFF` | 用 `mmap/mprotect` 在 Fiber 栈底加入 guard page |
 | `BUILD_TESTING` | `ON` | 控制 CTest 测试目标 |
 
@@ -225,7 +242,45 @@ cmake --install build --prefix "$PWD/install"
 
 安装规则会生成 `PulsarConfig.cmake`、版本文件与 `PulsarTargets.cmake`；
 下游可以用 `find_package(Pulsar CONFIG REQUIRED)`，配置文件会自动查找
-Threads 与 Boost.Context。
+Threads 与 Boost.Context；安装 RPC 目标时还会查找 Protobuf。
+
+### 3.4 可选 TCP 与 RPC
+
+```bash
+cmake -S . -B build-net -DCMAKE_BUILD_TYPE=Release -DPULSAR_BUILD_NET=ON
+cmake --build build-net -j
+./build-net/pulsar-tcp-echo server 42571
+# 另一个终端：
+./build-net/pulsar-tcp-echo client 42571
+
+cmake -S . -B build-rpc -DCMAKE_BUILD_TYPE=Release -DPULSAR_BUILD_RPC=ON
+cmake --build build-rpc -j
+ctest --test-dir build-rpc --output-on-failure
+cmake --install build-rpc --prefix "$PWD/install"
+```
+
+下游链接 `Pulsar::net` 或 `Pulsar::rpc` 时会自动获得下层目标。完整的
+`add_subdirectory`/`find_package` 消费者位于 `examples/downstream`；
+`examples/rpc_echo.cpp` 展示通用 Protobuf Service、Channel 和独立处理线程池。
+将 `examples/rpc_external/CMakeLists.txt`、`rpc_echo.cpp` 与
+`rpc_echo.proto` 一起复制到仓库外，再以 `CMAKE_PREFIX_PATH` 指向安装目录，
+可验证独立消费。新模块没有引入 StrataKV 业务消息、Muduo 或公共工具代码。
+
+显式 TCP 的 `Connect`、`ReadSome`、`ReadExact` 和 `WriteAll` 必须在所属
+`IOManager` 的 Fiber 上调用；目前地址使用数字 IPv4。连接对象拥有 fd，同一连接
+最多一位读取者和一位写入者；读写期限、关闭、连接上限及非读取对端的写入超时
+都有明确结果。调用方须让 `IOManager` 存活到所有连接和服务对象销毁后。
+
+RPC v1 请求为 `[varint32 header_size][RpcHeader][args]`，响应为
+`[network-order uint32 length][serialized response]`；头最多 64 KiB，消息最多
+64 MiB。每连接只允许一个在途请求，通道使用有界连接池；连接池或处理队列满时
+明确失败。v1 没有请求 ID、错误帧或自动重试：发送后断线时执行结果未知，
+幂等判断、leader 切换及业务重试由应用处理。同步 Service 在有界 pthread
+执行器上运行，不占用 I/O Worker；异步 Service 必须最终且仅一次调用 `done`，
+并在所有回调结束前保持 Service 存活。超时或关闭后晚到的 `done` 不会向旧连接
+发送响应。Provider 默认最多 1024 个连接、128 个排队处理任务和 128 MiB
+在途线协议缓冲；构造参数可以收紧这些上限。若停止期限内仍有异步回调，
+`Stop` 返回 `false`，调用方应保留 Service 并在回调结束后再次停止。
 
 ## 4. 测试与基准
 
@@ -316,6 +371,20 @@ taskset -c 0-1 ./build/pulsar-benchmark \
 交错 A/B、perf/futex 数据与已知限制见
 `docs/性能报告/2026-08-29-Pulsar-Work-Stealing调度器.md`。
 
+### 4.4 模块化变更验证
+
+2026-09-26 在同一 WSL/Release 环境中，开启 RPC 目标后 Pulsar CTest 通过
+10/10；包含独立 TCP 故障测试、通用 RPC 阻塞处理测试和分进程的新旧 RPC
+双向互通。未开启新目标的 `libpulsar.a` 和 `pulsar-benchmark` 与变更前
+构建产物逐字节相同。StrataKV 默认链接仍使用旧 `stratakv_rpc`；其 59 项
+CTest 前后均为 58 项通过，同一个 Auto-Balancer 检查失败。全量构建中原有
+`client_main.cpp` 编译错误仍在。五轮同机性能测试有几百分点的自然波动，
+因此不宣称绝对零开销或生产级性能保证；原始 A/B 数据和复跑脚本保存在
+关联 StrataKV OpenSpec 变更的 `evidence/` 目录。
+
+上述 58/59 与编译错误是模块化变更时的历史基线。随后修复客户端源码和
+Auto-Balancer 测试约定后，StrataKV Release 全量构建成功，CTest 通过 59/59。
+
 ## 5. 项目结构
 
 ```text
@@ -323,6 +392,8 @@ Pulsar/
 ├── CMakeLists.txt
 ├── include/pulsar/       # 公共头文件
 ├── src/                  # Fiber、Scheduler、IOManager、Hook 和同步实现
+├── proto/                # 可选 RPC v1 元数据协议
+├── examples/             # TCP、通用 RPC 与独立下游示例
 ├── tests/                # CTest 正确性测试
 └── benchmarks/           # 性能与压力基准
 ```
@@ -344,9 +415,12 @@ Pulsar/
 - GCC ASan 与发行版预编译的 fcontext 在重复切换压力下仍会不稳定；普通与 guard
   page 测试通过，但不能把当前 ASan 结果当作完整 Fiber 栈覆盖；
 - 尚未完成长期 soak 和跨发行版兼容性验证；
+- 可选网络/RPC 目前只支持数字 IPv4 TCP，不含 DNS、TLS、HTTP 和多路复用；
+- RPC v1 的部分发送失败无法判断服务端是否执行，不能在传输层安全重试；
 - API 和 ABI 仍可能变化，不承诺稳定兼容。
 
 ## 7. 许可
 
 本仓库当前未附带开源许可证；在添加明确许可证前，不默认授予复制、修改或
-再分发权利。
+再分发权利。早期代码标识及待核查事项记录在 `docs/source-and-license.md`；
+在核实来源、对应版本和许可义务之前，不发布再分发包。
