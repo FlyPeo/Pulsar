@@ -138,6 +138,10 @@ if(BUILD_TESTING AND PULSAR_BUILD_TESTS)
     target_link_libraries(pulsar-reuse-integration-check PRIVATE Pulsar::pulsar)
     add_test(NAME pulsar-reuse-integration-check COMMAND pulsar-reuse-integration-check)
 
+    add_executable(pulsar-file-check tests/file_check.cpp)
+    target_link_libraries(pulsar-file-check PRIVATE Pulsar::pulsar)
+    add_test(NAME pulsar-file-check COMMAND pulsar-file-check)
+
     if(PULSAR_BUILD_NET)
         add_executable(pulsar-net-check tests/net_check.cpp)
         target_link_libraries(pulsar-net-check PRIVATE Pulsar::net)
@@ -153,6 +157,15 @@ if(BUILD_TESTING AND PULSAR_BUILD_TESTS)
         target_include_directories(pulsar-rpc-fault-check PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
         target_link_libraries(pulsar-rpc-fault-check PRIVATE Pulsar::rpc)
         add_test(NAME pulsar-rpc-fault-check COMMAND pulsar-rpc-fault-check)
+
+        add_executable(pulsar-rpc-multiplex-check
+            tests/rpc_multiplex_check.cpp
+            ${PULSAR_ECHO_PROTO_SOURCES}
+            ${PULSAR_ECHO_PROTO_HEADERS}
+        )
+        target_include_directories(pulsar-rpc-multiplex-check PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+        target_link_libraries(pulsar-rpc-multiplex-check PRIVATE Pulsar::rpc)
+        add_test(NAME pulsar-rpc-multiplex-check COMMAND pulsar-rpc-multiplex-check)
     endif()
 endif()
 

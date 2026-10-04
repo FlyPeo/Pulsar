@@ -7,7 +7,11 @@
 #include "sys/epoll.h"
 #include "timer.hpp"
 
+#include <type_traits>
+
 namespace pulsar {
+class BlockingThreadPool;
+
 enum Event {
   NONE = 0x0,
   READ = 0x1,
@@ -47,9 +51,10 @@ class IOManager : public Scheduler, public TimerManager {
  public:
   typedef std::shared_ptr<IOManager> ptr;
 
-  IOManager(size_t threads = 1, bool use_caller = true, const std::string &name = "IOManager");
+  IOManager(size_t threads = 1, bool use_caller = true, const std::string &name = "IOManager",
+            size_t blocking_threads = 4);
   IOManager(size_t threads, bool use_caller, const std::string &name,
-            SchedulerReuseOptions reuseOptions);
+            SchedulerReuseOptions reuseOptions, size_t blocking_threads = 4);
   ~IOManager();
   // 添加事件
   int addEvent(int fd, Event event, std::function<void()> cb = nullptr);
@@ -60,6 +65,63 @@ class IOManager : public Scheduler, public TimerManager {
   // 取消所有事件
   bool cancelAll(int fd);
   static IOManager *GetThis();
+
+  // 提交阻塞任务至专用线程池，完成后重新将协程调度回原 worker
+  void submitBlocking(std::function<void()> task);
+
+  // 在独立阻塞线程池中执行阻塞操作，当前协程让出执行权，完成后自动 resume
+  template <typename F>
+  auto asyncBlocking(F &&f) -> typename std::invoke_result<F>::type {
+    using R = typename std::invoke_result<F>::type;
+    Fiber::ptr cur = Fiber::GetThis();
+    if (!cur || cur->getId() == 0) {
+      return f();
+    }
+
+    struct State {
+      typename std::conditional<std::is_void<R>::value, int, R>::type result{};
+      int savedErrno = 0;
+      std::exception_ptr ex;
+    };
+
+    auto state = std::make_shared<State>();
+    int thread_id = GetThreadId();
+
+    pendingBlockingTasks_++;
+    submitBlocking([state, f = std::forward<F>(f), cur, this, thread_id]() mutable {
+      try {
+        if constexpr (std::is_void<R>::value) {
+          f();
+        } else {
+          state->result = f();
+        }
+        state->savedErrno = errno;
+      } catch (...) {
+        state->ex = std::current_exception();
+      }
+      this->scheduler(cur, thread_id);
+      this->pendingBlockingTasks_--;
+    });
+
+    cur->yield();
+
+    if (state->ex) {
+      std::rethrow_exception(state->ex);
+    }
+    errno = state->savedErrno;
+    if constexpr (!std::is_void<R>::value) {
+      return std::move(state->result);
+    }
+  }
+
+  template <typename F>
+  static auto AsyncBlocking(F &&f) -> typename std::invoke_result<F>::type {
+    IOManager *iom = IOManager::GetThis();
+    if (iom) {
+      return iom->asyncBlocking(std::forward<F>(f));
+    }
+    return f();
+  }
 
  protected:
   // 通知调度器有任务要调度
@@ -79,6 +141,8 @@ class IOManager : public Scheduler, public TimerManager {
   int tickleFds_[2];
   // 正在等待执行的IO事件数量
   std::atomic<size_t> pendingEventCnt_ = {0};
+  std::atomic<size_t> pendingBlockingTasks_ = {0};
+  std::unique_ptr<BlockingThreadPool> blockingThreadPool_;
   RWMutex mutex_;
   std::vector<FdContext *> fdContexts_;
 };

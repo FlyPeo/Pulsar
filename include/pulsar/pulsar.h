@@ -3,6 +3,7 @@
 
 #include "fd_manager.hpp"
 #include "fiber.hpp"
+#include "file.hpp"
 #include "hook.hpp"
 #include "iomanager.hpp"
 #include "sync.hpp"

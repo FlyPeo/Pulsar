@@ -108,7 +108,8 @@ class Scheduler {
   // opposite end and never migrate a task pinned to another OS thread.
   struct alignas(64) WorkerQueue {
     Mutex mutex;
-    std::deque<SchedulerTask> tasks;
+    std::deque<SchedulerTask> unpinnedTasks;
+    std::deque<SchedulerTask> pinnedTasks;
     std::vector<Fiber::ptr> callbackFiberCache;
     std::atomic<int> threadId{-1};
     std::atomic<bool> active{false};

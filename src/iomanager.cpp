@@ -1,6 +1,74 @@
 #include "iomanager.hpp"
 
+#include <condition_variable>
+#include <mutex>
+#include <queue>
+#include <thread>
+
 namespace pulsar {
+
+class BlockingThreadPool {
+ public:
+  explicit BlockingThreadPool(size_t threads = 4) : stop_(false) {
+    if (threads == 0) threads = 1;
+    workers_.reserve(threads);
+    for (size_t i = 0; i < threads; ++i) {
+      workers_.emplace_back([this] {
+        while (true) {
+          std::function<void()> task;
+          {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
+            if (stop_ && tasks_.empty()) {
+              return;
+            }
+            task = std::move(tasks_.front());
+            tasks_.pop();
+          }
+          if (task) {
+            task();
+          }
+        }
+      });
+    }
+  }
+
+  ~BlockingThreadPool() {
+    stop();
+  }
+
+  void submit(std::function<void()> task) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stop_) return;
+      tasks_.push(std::move(task));
+    }
+    cv_.notify_one();
+  }
+
+  void stop() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stop_) return;
+      stop_ = true;
+    }
+    cv_.notify_all();
+    for (auto &t : workers_) {
+      if (t.joinable()) {
+        t.join();
+      }
+    }
+    workers_.clear();
+  }
+
+ private:
+  std::vector<std::thread> workers_;
+  std::queue<std::function<void()>> tasks_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool stop_ = false;
+};
+
 // 获取事件上下文
 EventContext &FdContext::getEveContext(Event event) {
   switch (event) {
@@ -34,12 +102,13 @@ void FdContext::triggerEvent(Event event) {
   return;
 }
 
-IOManager::IOManager(size_t threads, bool use_caller, const std::string &name)
-    : IOManager(threads, use_caller, name, SchedulerReuseOptions{}) {}
+IOManager::IOManager(size_t threads, bool use_caller, const std::string &name, size_t blocking_threads)
+    : IOManager(threads, use_caller, name, SchedulerReuseOptions{}, blocking_threads) {}
 
 IOManager::IOManager(size_t threads, bool use_caller, const std::string &name,
-                     SchedulerReuseOptions reuseOptions)
-    : Scheduler(threads, use_caller, name, std::move(reuseOptions)) {
+                     SchedulerReuseOptions reuseOptions, size_t blocking_threads)
+    : Scheduler(threads, use_caller, name, std::move(reuseOptions)),
+      blockingThreadPool_(std::make_unique<BlockingThreadPool>(blocking_threads)) {
   epfd_ = epoll_create(5000);
   int ret = pipe(tickleFds_);
   CondPanic(ret == 0, "pipe error");
@@ -63,6 +132,9 @@ IOManager::IOManager(size_t threads, bool use_caller, const std::string &name,
 }
 IOManager::~IOManager() {
   stop();
+  if (blockingThreadPool_) {
+    blockingThreadPool_->stop();
+  }
   close(epfd_);
   close(tickleFds_[0]);
   close(tickleFds_[1]);
@@ -71,6 +143,14 @@ IOManager::~IOManager() {
     if (fdContexts_[i]) {
       delete fdContexts_[i];
     }
+  }
+}
+
+void IOManager::submitBlocking(std::function<void()> task) {
+  if (blockingThreadPool_) {
+    blockingThreadPool_->submit(std::move(task));
+  } else {
+    task();
   }
 }
 
@@ -369,9 +449,9 @@ bool IOManager::stopping() {
 }
 
 bool IOManager::stopping(uint64_t &timeout) {
-  // 所有待调度的Io事件执行结束后，才允许退出
+  // 所有待调度的Io事件及阻塞任务执行结束后，才允许退出
   timeout = getNextTimer();
-  return timeout == ~0ull && pendingEventCnt_ == 0 && Scheduler::stopping();
+  return timeout == ~0ull && pendingEventCnt_ == 0 && pendingBlockingTasks_ == 0 && Scheduler::stopping();
 }
 
 void IOManager::contextResize(size_t size) {

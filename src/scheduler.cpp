@@ -145,8 +145,12 @@ bool Scheduler::enqueueTask(SchedulerTask task) {
   bool wasEmpty = false;
   {
     Mutex::Lock lock(queue.mutex);
-    wasEmpty = queue.tasks.empty();
-    queue.tasks.emplace_back(std::move(task));
+    wasEmpty = queue.unpinnedTasks.empty() && queue.pinnedTasks.empty();
+    if (task.thread_ != -1) {
+      queue.pinnedTasks.push_back(std::move(task));
+    } else {
+      queue.unpinnedTasks.push_back(std::move(task));
+    }
   }
   return wasEmpty;
 }
@@ -154,30 +158,48 @@ bool Scheduler::enqueueTask(SchedulerTask task) {
 bool Scheduler::tryTakeLocal(size_t workerIndex, int threadId, SchedulerTask &task) {
   WorkerQueue &queue = *workerQueues_[workerIndex];
   Mutex::Lock lock(queue.mutex);
-  for (auto it = queue.tasks.begin(); it != queue.tasks.end(); ++it) {
-    if (it->thread_ == -1 || it->thread_ == threadId) {
-      task = std::move(*it);
-      queue.tasks.erase(it);
-      return true;
+  if (!queue.pinnedTasks.empty()) {
+    for (auto it = queue.pinnedTasks.begin(); it != queue.pinnedTasks.end(); ++it) {
+      if (it->thread_ == -1 || it->thread_ == threadId) {
+        task = std::move(*it);
+        queue.pinnedTasks.erase(it);
+        return true;
+      }
     }
+  }
+  if (!queue.unpinnedTasks.empty()) {
+    task = std::move(queue.unpinnedTasks.front());
+    queue.unpinnedTasks.pop_front();
+    return true;
   }
   return false;
 }
 
 bool Scheduler::trySteal(size_t workerIndex, int threadId, SchedulerTask &task) {
   const size_t workerCount = workerQueues_.size();
-  for (size_t offset = 1; offset < workerCount; ++offset) {
+  if (workerCount <= 1) return false;
+
+  static thread_local uint32_t tls_victim_seed = static_cast<uint32_t>(workerIndex * 2654435761u + 1u);
+  tls_victim_seed = tls_victim_seed * 1664525u + 1013904223u;
+  const size_t startOffset = (tls_victim_seed % (workerCount - 1)) + 1;
+
+  for (size_t i = 0; i < workerCount - 1; ++i) {
+    const size_t offset = ((startOffset + i - 1) % (workerCount - 1)) + 1;
     const size_t victimIndex = (workerIndex + offset) % workerCount;
     WorkerQueue &victim = *workerQueues_[victimIndex];
     Mutex::Lock lock(victim.mutex);
-    for (auto it = victim.tasks.end(); it != victim.tasks.begin();) {
-      --it;
-      // An unpinned task may migrate. A pinned task is only taken by its
-      // owning OS thread, including tasks queued before that Worker registered.
-      if (it->thread_ == -1 || it->thread_ == threadId) {
-        task = std::move(*it);
-        victim.tasks.erase(it);
-        return true;
+    if (!victim.unpinnedTasks.empty()) {
+      task = std::move(victim.unpinnedTasks.back());
+      victim.unpinnedTasks.pop_back();
+      return true;
+    }
+    if (!victim.pinnedTasks.empty()) {
+      for (auto it = victim.pinnedTasks.begin(); it != victim.pinnedTasks.end(); ++it) {
+        if (it->thread_ == threadId) {
+          task = std::move(*it);
+          victim.pinnedTasks.erase(it);
+          return true;
+        }
       }
     }
   }
@@ -193,10 +215,11 @@ bool Scheduler::hasPendingTasks() {
   for (const auto &queuePtr : workerQueues_) {
     WorkerQueue &queue = *queuePtr;
     Mutex::Lock lock(queue.mutex);
-    if (!queue.tasks.empty()) return true;
+    if (!queue.unpinnedTasks.empty() || !queue.pinnedTasks.empty()) return true;
   }
   return false;
 }
+
 
 Fiber::ptr Scheduler::acquireCallbackFiber(size_t workerIndex, std::function<void()> cb) {
   WorkerQueue &worker = *workerQueues_[workerIndex];

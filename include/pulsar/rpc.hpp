@@ -38,7 +38,8 @@ class Channel final : public google::protobuf::RpcChannel {
  public:
   Channel(IOManager& owner, std::string ipv4, uint16_t port,
           size_t max_connections = 4,
-          std::chrono::milliseconds timeout = std::chrono::seconds(5));
+          std::chrono::milliseconds timeout = std::chrono::seconds(5),
+          bool multiplex = false);
   ~Channel() override;
   Channel(const Channel&) = delete;
   Channel& operator=(const Channel&) = delete;
@@ -47,6 +48,12 @@ class Channel final : public google::protobuf::RpcChannel {
                   const google::protobuf::Message* request,
                   google::protobuf::Message* response,
                   google::protobuf::Closure* done) override;
+
+  static std::unique_ptr<Channel> CreateMultiplexed(
+      IOManager& owner, std::string ipv4, uint16_t port,
+      std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+    return std::make_unique<Channel>(owner, std::move(ipv4), port, 1, timeout, true);
+  }
 
  private:
   struct State;

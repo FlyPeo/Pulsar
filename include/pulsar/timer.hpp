@@ -31,6 +31,7 @@ class Timer : public std::enable_shared_from_this<Timer> {
   std::function<void()> cb_;
   // 管理器
   TimerManager *manager_ = nullptr;
+  std::atomic<bool> cancelled_{false};
 
  private:
   struct Comparator {
@@ -62,12 +63,19 @@ class TimerManager {
   // 检测服务器时间是否被调后了
   bool detectClockRolllover(uint64_t now_ms);
 
+  void insertToWheel(Timer::ptr val);
+  void advanceWheel(uint64_t now_ms, std::vector<std::function<void()>> &cbs);
+  void updateEarliestNext(uint64_t next_ms);
+
   RWMutex mutex_;
-  // 定时器集合
+  std::vector<std::vector<Timer::ptr>> wheel0_;
+  std::vector<std::vector<Timer::ptr>> wheel1_;
+  std::vector<std::vector<Timer::ptr>> wheel2_;
+  std::vector<std::vector<Timer::ptr>> wheel3_;
+  // 超出时间轮范围降级到红黑树
   std::set<Timer::ptr, Timer::Comparator> timers_;
-  // 是否触发OnTimerInsertedAtFront
+  std::atomic<uint64_t> earliestNext_{~0ull};
   bool tickled_ = false;
-  // 上次执行时间
   uint64_t previouseTime_ = 0;
 };
 }  // namespace pulsar

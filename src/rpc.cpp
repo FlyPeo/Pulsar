@@ -1,4 +1,5 @@
 #include <pulsar/rpc.hpp>
+#include <pulsar/sync.hpp>
 
 #include <pulsar_rpc_header.pb.h>
 
@@ -136,28 +137,123 @@ void Controller::NotifyOnCancel(google::protobuf::Closure* callback) {
   if (run) callback->Run();
 }
 
-struct Channel::State {
+struct Channel::State : std::enable_shared_from_this<Channel::State> {
   struct Slot {
     bool busy = false;
     net::Connection::ptr conn;
   };
+  struct PendingCall {
+    Fiber::ptr waiter;
+    int worker = -1;
+    std::string payload;
+    std::string error;
+    bool done = false;
+    bool failed = false;
+  };
+
   State(IOManager& io, std::string address, uint16_t p, size_t limit,
-        std::chrono::milliseconds duration)
-      : owner(io), ip(std::move(address)), port(p), timeout(duration) {
-    for (size_t i = 0; i < limit; ++i) slots.emplace_back(std::make_unique<Slot>());
+        std::chrono::milliseconds duration, bool is_multiplex)
+      : owner(io), ip(std::move(address)), port(p), timeout(duration),
+        multiplex(is_multiplex) {
+    if (!multiplex) {
+      for (size_t i = 0; i < limit; ++i) slots.emplace_back(std::make_unique<Slot>());
+    }
   }
+
+  void ReaderLoop() {
+    while (!closed && conn && !conn->closed()) {
+      uint32_t header_size = 0;
+      if (!ReadVarint32(*conn, &header_size, std::chrono::seconds(60))) {
+        if (errno == ETIMEDOUT && !closed) {
+          continue;
+        }
+        break;
+      }
+      if (header_size == 0 || header_size > kMaxHeader) {
+        break;
+      }
+      std::string header_data(header_size, '\0');
+      if (!conn->ReadExact(header_data.data(), header_size, std::chrono::seconds(10))) {
+        break;
+      }
+      RPC::RpcHeader header;
+      if (!header.ParseFromArray(header_data.data(), static_cast<int>(header_size))) {
+        break;
+      }
+      std::string payload(header.args_size(), '\0');
+      if (header.args_size() &&
+          !conn->ReadExact(payload.data(), header.args_size(), std::chrono::seconds(10))) {
+        break;
+      }
+
+      std::shared_ptr<PendingCall> call;
+      {
+        std::lock_guard<std::mutex> lock(pending_mutex);
+        auto it = pending_calls.find(header.request_id());
+        if (it != pending_calls.end()) {
+          call = it->second;
+          pending_calls.erase(it);
+        }
+      }
+      if (call) {
+        if (!header.error().empty()) {
+          call->failed = true;
+          call->error = header.error();
+        } else {
+          call->payload = std::move(payload);
+        }
+        call->done = true;
+        owner.scheduler(call->waiter, call->worker);
+      }
+    }
+
+    reader_running = false;
+    if (conn && !conn->closed()) {
+      conn->Close();
+    }
+    std::map<uint64_t, std::shared_ptr<PendingCall>> remaining;
+    {
+      std::lock_guard<std::mutex> lock(pending_mutex);
+      remaining.swap(pending_calls);
+    }
+    for (auto& [id, call] : remaining) {
+      if (!call->done) {
+        call->failed = true;
+        call->error = "RPC connection closed";
+        call->done = true;
+        owner.scheduler(call->waiter, call->worker);
+      }
+    }
+  }
+
   IOManager& owner;
   std::string ip;
   uint16_t port;
   std::chrono::milliseconds timeout;
+  const bool multiplex;
   std::mutex mutex;
   std::vector<std::unique_ptr<Slot>> slots;
+
+  // Multiplexed channel members
+  net::Connection::ptr conn;
+  FiberMutex write_mutex;
+  std::mutex pending_mutex;
+  std::map<uint64_t, std::shared_ptr<PendingCall>> pending_calls;
+  std::atomic<uint64_t> next_request_id{1};
+  std::atomic<bool> reader_running{false};
+  std::atomic<bool> closed{false};
 };
 
 Channel::Channel(IOManager& owner, std::string ipv4, uint16_t port,
-                 size_t max_connections, std::chrono::milliseconds timeout)
-    : state_(std::make_shared<State>(owner, std::move(ipv4), port, max_connections, timeout)) {}
+                 size_t max_connections, std::chrono::milliseconds timeout,
+                 bool multiplex)
+    : state_(std::make_shared<State>(owner, std::move(ipv4), port, max_connections, timeout, multiplex)) {}
+
 Channel::~Channel() {
+  state_->closed = true;
+  if (state_->conn) {
+    state_->conn->Close();
+  }
   for (auto& slot : state_->slots)
     if (slot->conn) slot->conn->Close();
 }
@@ -168,6 +264,118 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
                          google::protobuf::Message* response,
                          google::protobuf::Closure* done) {
   auto state = state_;
+  if (state->multiplex) {
+    if (IOManager::GetThis() != &state->owner || !method || !request || !response) {
+      Fail(controller, "Pulsar RPC must run in its IOManager Fiber");
+      if (done) done->Run();
+      return;
+    }
+    std::string args;
+    if (!request->SerializeToString(&args) || args.size() > kMaxMessage) {
+      Fail(controller, "RPC request serialization or size failure");
+      if (done) done->Run();
+      return;
+    }
+
+    uint64_t req_id = state->next_request_id.fetch_add(1);
+    if (req_id == 0) req_id = state->next_request_id.fetch_add(1);
+
+    RPC::RpcHeader header;
+    header.set_service_name(method->service()->name());
+    header.set_method_name(method->name());
+    header.set_args_size(static_cast<uint32_t>(args.size()));
+    header.set_request_id(req_id);
+
+    std::string encoded;
+    if (!header.SerializeToString(&encoded) || encoded.empty() ||
+        encoded.size() > kMaxHeader ||
+        args.size() > kMaxMessage - encoded.size() - 5) {
+      Fail(controller, "RPC header serialization or size failure");
+      if (done) done->Run();
+      return;
+    }
+    std::string frame;
+    frame.reserve(5 + encoded.size() + args.size());
+    EncodeVarint32(static_cast<uint32_t>(encoded.size()), &frame);
+    frame += encoded;
+    frame += args;
+
+    auto call = std::make_shared<State::PendingCall>();
+    call->waiter = Fiber::GetThis();
+    call->worker = GetThreadId();
+
+    bool send_ok = false;
+    state->write_mutex.lock();
+    if (!state->conn || state->conn->closed()) {
+      state->conn = net::Connection::Connect(state->owner, state->ip, state->port, state->timeout);
+      if (!state->conn) {
+        state->write_mutex.unlock();
+        Fail(controller, "RPC connect failed: " + std::to_string(errno));
+        if (done) done->Run();
+        return;
+      }
+      if (!state->reader_running) {
+        state->reader_running = true;
+        auto s = state;
+        state->owner.scheduler([s]() { s->ReaderLoop(); });
+      }
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(state->pending_mutex);
+      state->pending_calls[req_id] = call;
+    }
+
+    if (state->conn && !state->conn->closed()) {
+      send_ok = state->conn->WriteAll(frame.data(), frame.size(), state->timeout);
+    }
+    state->write_mutex.unlock();
+
+    if (!send_ok) {
+      {
+        std::lock_guard<std::mutex> lock(state->pending_mutex);
+        state->pending_calls.erase(req_id);
+      }
+      Fail(controller, "RPC send failed: " + std::to_string(errno));
+      if (done) done->Run();
+      return;
+    }
+
+    Timer::ptr timer;
+    if (state->timeout.count() > 0) {
+      auto s = state;
+      timer = state->owner.addTimer(static_cast<uint64_t>(state->timeout.count()), [s, req_id, call]() {
+        bool need_wake = false;
+        {
+          std::lock_guard<std::mutex> lock(s->pending_mutex);
+          auto it = s->pending_calls.find(req_id);
+          if (it != s->pending_calls.end()) {
+            s->pending_calls.erase(it);
+            call->failed = true;
+            call->error = "RPC request timeout";
+            call->done = true;
+            need_wake = true;
+          }
+        }
+        if (need_wake) {
+          s->owner.scheduler(call->waiter, call->worker);
+        }
+      });
+    }
+
+    call->waiter->yield();
+    if (timer) timer->cancel();
+
+    if (call->failed) {
+      Fail(controller, call->error);
+    } else if (!response->ParseFromArray(call->payload.data(), static_cast<int>(call->payload.size()))) {
+      Fail(controller, "RPC response parse failed");
+    }
+
+    if (done) done->Run();
+    return;
+  }
+
   State::Slot* slot = nullptr;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
@@ -324,6 +532,7 @@ struct Provider::State : std::enable_shared_from_this<Provider::State> {
   std::atomic<bool> accepting{false};
 
   void Handle(net::Connection::ptr conn) {
+    auto write_mutex = std::make_shared<FiberMutex>();
     while (accepting && !conn->closed()) {
       uint32_t header_size = 0;
       if (!ReadVarint32(*conn, &header_size, request_timeout)) break;
@@ -356,60 +565,171 @@ struct Provider::State : std::enable_shared_from_this<Provider::State> {
       ctx->request.reset(service.service->GetRequestPrototype(method).New());
       ctx->response.reset(service.service->GetResponsePrototype(method).New());
       if (!ctx->request->ParseFromArray(args.data(), static_cast<int>(args.size()))) break;
-      ctx->waiter = Fiber::GetThis();
-      ctx->worker = GetThreadId();
-      {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (!accepting || outstanding >= max_connections) break;
-        pending.erase(
-            std::remove_if(pending.begin(), pending.end(),
-                           [](const std::weak_ptr<CallContext>& item) {
-                             return item.expired();
-                           }),
-            pending.end());
-        pending.push_back(ctx);
-        ++pending_count;
-        ++outstanding;
-      }
-      const bool queued = executor.Submit([ctx, service, method] {
-        auto* done = new DoneClosure(ctx);
-        try {
-          service.service->CallMethod(method, nullptr, ctx->request.get(),
-                                      ctx->response.get(), done);
-        } catch (...) {
-          // A throwing service violates the Protobuf completion contract.
-          // The closure may have been retained, so leave its lifetime to Run().
-          ctx->Finish(2);
-        }
-      });
-      if (!queued) {
+
+      const uint64_t req_id = header.request_id();
+
+      if (req_id == 0) {
+        ctx->waiter = Fiber::GetThis();
+        ctx->worker = GetThreadId();
         {
           std::lock_guard<std::mutex> lock(mutex);
-          --outstanding;
+          if (!accepting || outstanding >= max_connections) break;
+          pending.erase(
+              std::remove_if(pending.begin(), pending.end(),
+                             [](const std::weak_ptr<CallContext>& item) {
+                               return item.expired();
+                             }),
+              pending.end());
+          pending.push_back(ctx);
+          ++pending_count;
+          ++outstanding;
+        }
+        const bool queued = executor.Submit([ctx, service, method] {
+          auto* done = new DoneClosure(ctx);
+          try {
+            service.service->CallMethod(method, nullptr, ctx->request.get(),
+                                        ctx->response.get(), done);
+          } catch (...) {
+            // A throwing service violates the Protobuf completion contract.
+            // The closure may have been retained, so leave its lifetime to Run().
+            ctx->Finish(2);
+          }
+        });
+        if (!queued) {
+          {
+            std::lock_guard<std::mutex> lock(mutex);
+            --outstanding;
+            drained.notify_all();
+          }
+          ctx->Finish(2);
+        }
+        Timer::ptr timer;
+        if (request_timeout.count() >= 0)
+          timer = io.addTimer(static_cast<uint64_t>(request_timeout.count()),
+                              [ctx] { ctx->Finish(2); });
+        ctx->waiter->yield();
+        if (timer) timer->cancel();
+        const bool completed = ctx->outcome == 1;
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          --pending_count;
           drained.notify_all();
         }
-        ctx->Finish(2);
+        if (!completed || conn->closed() || !accepting) break;
+        const size_t response_size = ctx->response->ByteSizeLong();
+        if (response_size > kMaxMessage || !reservation.Add(response_size)) break;
+        std::string payload;
+        if (!ctx->response->SerializeToString(&payload) || payload.size() > kMaxMessage) break;
+        const uint32_t length = htonl(static_cast<uint32_t>(payload.size()));
+        write_mutex->lock();
+        bool write_ok = conn->WriteAll(&length, sizeof(length), request_timeout) &&
+                        conn->WriteAll(payload.data(), payload.size(), request_timeout);
+        write_mutex->unlock();
+        if (!write_ok) break;
+      } else {
+        // Multiplexed mode: async pipeline, Handle never yields for business logic!
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          if (!accepting || outstanding >= max_connections * 64) break;
+          ++outstanding;
+          ++pending_count;
+        }
+
+        auto self = shared_from_this();
+        class MultiplexDoneClosure final : public google::protobuf::Closure {
+         public:
+          MultiplexDoneClosure(std::shared_ptr<State> state,
+                               net::Connection::ptr conn,
+                               std::shared_ptr<FiberMutex> write_mutex,
+                               std::shared_ptr<CallContext> ctx,
+                               uint64_t req_id,
+                               std::chrono::milliseconds timeout)
+              : state_(std::move(state)), conn_(std::move(conn)),
+                write_mutex_(std::move(write_mutex)), ctx_(std::move(ctx)),
+                req_id_(req_id), timeout_(timeout) {}
+
+          void Run() override {
+            auto s = state_;
+            auto c = conn_;
+            auto wm = write_mutex_;
+            auto call = ctx_;
+            auto req_id = req_id_;
+            auto to = timeout_;
+
+            s->io.scheduler([s, c, wm, call, req_id, to]() {
+              std::string payload;
+              std::string error_msg;
+              if (call->outcome.load() == 2) {
+                error_msg = "RPC handler execution error or timeout";
+              } else if (!call->response->SerializeToString(&payload) || payload.size() > kMaxMessage) {
+                error_msg = "RPC response serialization failure";
+              }
+
+              RPC::RpcHeader resp_header;
+              resp_header.set_request_id(req_id);
+              if (!error_msg.empty()) {
+                resp_header.set_error(error_msg);
+              } else {
+                resp_header.set_args_size(static_cast<uint32_t>(payload.size()));
+              }
+
+              std::string encoded;
+              resp_header.SerializeToString(&encoded);
+              std::string frame;
+              frame.reserve(5 + encoded.size() + payload.size());
+              EncodeVarint32(static_cast<uint32_t>(encoded.size()), &frame);
+              frame += encoded;
+              if (error_msg.empty()) {
+                frame += payload;
+              }
+
+              wm->lock();
+              if (c && !c->closed()) {
+                c->WriteAll(frame.data(), frame.size(), to);
+              }
+              wm->unlock();
+
+              {
+                std::lock_guard<std::mutex> lock(s->mutex);
+                --s->outstanding;
+                --s->pending_count;
+                s->drained.notify_all();
+              }
+            });
+
+            delete this;
+          }
+
+         private:
+          std::shared_ptr<State> state_;
+          net::Connection::ptr conn_;
+          std::shared_ptr<FiberMutex> write_mutex_;
+          std::shared_ptr<CallContext> ctx_;
+          uint64_t req_id_;
+          std::chrono::milliseconds timeout_;
+        };
+
+        const bool queued = executor.Submit([ctx, service, method, self, conn, write_mutex, req_id, to = request_timeout] {
+          auto* done = new MultiplexDoneClosure(self, conn, write_mutex, ctx, req_id, to);
+          try {
+            service.service->CallMethod(method, nullptr, ctx->request.get(),
+                                        ctx->response.get(), done);
+          } catch (...) {
+            ctx->outcome.store(2);
+            done->Run();
+          }
+        });
+
+        if (!queued) {
+          {
+            std::lock_guard<std::mutex> lock(mutex);
+            --outstanding;
+            --pending_count;
+            drained.notify_all();
+          }
+          break;
+        }
       }
-      Timer::ptr timer;
-      if (request_timeout.count() >= 0)
-        timer = io.addTimer(static_cast<uint64_t>(request_timeout.count()),
-                            [ctx] { ctx->Finish(2); });
-      ctx->waiter->yield();
-      if (timer) timer->cancel();
-      const bool completed = ctx->outcome == 1;
-      {
-        std::lock_guard<std::mutex> lock(mutex);
-        --pending_count;
-        drained.notify_all();
-      }
-      if (!completed || conn->closed() || !accepting) break;
-      const size_t response_size = ctx->response->ByteSizeLong();
-      if (response_size > kMaxMessage || !reservation.Add(response_size)) break;
-      std::string payload;
-      if (!ctx->response->SerializeToString(&payload) || payload.size() > kMaxMessage) break;
-      const uint32_t length = htonl(static_cast<uint32_t>(payload.size()));
-      if (!conn->WriteAll(&length, sizeof(length), request_timeout) ||
-          !conn->WriteAll(payload.data(), payload.size(), request_timeout)) break;
     }
   }
 };

@@ -26,17 +26,21 @@ Timer::Timer(uint64_t ms, std::function<void()> cb, bool recuring, TimerManager 
 }
 Timer::Timer(uint64_t next) : next_(next) {}
 bool Timer::cancel() {
-  RWMutex::WriteLock lock(manager_->mutex_);
-  if (cb_) {
-    cb_ = nullptr;
-    auto it = manager_->timers_.find(shared_from_this());
-    manager_->timers_.erase(it);
-    return true;
+  if (cancelled_.exchange(true)) {
+    return false;
   }
-  return false;
+  RWMutex::WriteLock lock(manager_->mutex_);
+  cb_ = nullptr;
+  return true;
 }
 
-TimerManager::TimerManager() { previouseTime_ = GetElapsedMS(); }
+TimerManager::TimerManager() {
+  previouseTime_ = GetElapsedMS();
+  wheel0_.resize(256);
+  wheel1_.resize(64);
+  wheel2_.resize(64);
+  wheel3_.resize(64);
+}
 
 TimerManager::~TimerManager() {}
 
@@ -60,71 +64,140 @@ Timer::ptr TimerManager::addConditionTimer(uint64_t ms, std::function<void()> cb
 }
 
 uint64_t TimerManager::getNextTimer() {
-  RWMutex::ReadLock lock(mutex_);
   tickled_ = false;
-  if (timers_.empty()) {
+  uint64_t earliest = earliestNext_.load(std::memory_order_relaxed);
+  uint64_t now_ms = GetElapsedMS();
+  if (earliest == ~0ull) {
+    RWMutex::ReadLock lock(mutex_);
+    if (!timers_.empty()) {
+      earliest = (*timers_.begin())->next_;
+    }
+  }
+  if (earliest == ~0ull) {
     return ~0ull;
   }
-  const Timer::ptr &next = *timers_.begin();
-  uint64_t now_ms = GetElapsedMS();
-  if (now_ms >= next->next_) {
+  if (now_ms >= earliest) {
     return 0;
-  } else {
-    return next->next_ - now_ms;
   }
+  return earliest - now_ms;
+}
+
+void TimerManager::updateEarliestNext(uint64_t next_ms) {
+  uint64_t cur = earliestNext_.load(std::memory_order_relaxed);
+  while (next_ms < cur) {
+    if (earliestNext_.compare_exchange_weak(cur, next_ms, std::memory_order_relaxed)) {
+      break;
+    }
+  }
+}
+
+void TimerManager::insertToWheel(Timer::ptr val) {
+  uint64_t now_ms = GetElapsedMS();
+  uint64_t diff = val->next_ > now_ms ? val->next_ - now_ms : 0;
+  updateEarliestNext(val->next_);
+
+  if (diff < 256) {
+    size_t slot = (val->next_) & 0xFF;
+    wheel0_[slot].push_back(val);
+  } else if (diff < (1ULL << 14)) {
+    size_t slot = (val->next_ >> 8) & 0x3F;
+    wheel1_[slot].push_back(val);
+  } else if (diff < (1ULL << 20)) {
+    size_t slot = (val->next_ >> 14) & 0x3F;
+    wheel2_[slot].push_back(val);
+  } else if (diff < (1ULL << 26)) {
+    size_t slot = (val->next_ >> 20) & 0x3F;
+    wheel3_[slot].push_back(val);
+  } else {
+    timers_.insert(val);
+  }
+}
+
+void TimerManager::advanceWheel(uint64_t now_ms, std::vector<std::function<void()>> &cbs) {
+  uint64_t nextEarliest = ~0ull;
+
+  // Process wheel0
+  for (size_t i = 0; i < wheel0_.size(); ++i) {
+    auto &slot = wheel0_[i];
+    if (slot.empty()) continue;
+    std::vector<Timer::ptr> remaining;
+    for (auto &timer : slot) {
+      if (timer->cancelled_.load()) continue;
+      if (timer->next_ <= now_ms) {
+        if (timer->cb_) cbs.push_back(timer->cb_);
+        if (timer->recurring_) {
+          timer->next_ = now_ms + timer->ms_;
+          timer->cancelled_ = false;
+          insertToWheel(timer);
+        } else {
+          timer->cb_ = nullptr;
+          timer->cancelled_ = true;
+        }
+      } else {
+        remaining.push_back(timer);
+        if (timer->next_ < nextEarliest) nextEarliest = timer->next_;
+      }
+    }
+    slot.swap(remaining);
+  }
+
+  // Cascade upper wheels
+  auto cascade = [&](std::vector<std::vector<Timer::ptr>> &wheel) {
+    for (auto &slot : wheel) {
+      if (slot.empty()) continue;
+      std::vector<Timer::ptr> toInsert;
+      toInsert.swap(slot);
+      for (auto &timer : toInsert) {
+        if (!timer->cancelled_.load()) {
+          insertToWheel(timer);
+        }
+      }
+    }
+  };
+  cascade(wheel1_);
+  cascade(wheel2_);
+  cascade(wheel3_);
+
+  // Fallback tree timers
+  while (!timers_.empty() && (*timers_.begin())->next_ <= now_ms) {
+    auto timer = *timers_.begin();
+    timers_.erase(timers_.begin());
+    if (timer->cancelled_.load()) continue;
+    if (timer->cb_) cbs.push_back(timer->cb_);
+    if (timer->recurring_) {
+      timer->next_ = now_ms + timer->ms_;
+      timer->cancelled_ = false;
+      insertToWheel(timer);
+    } else {
+      timer->cb_ = nullptr;
+      timer->cancelled_ = true;
+    }
+  }
+  if (!timers_.empty()) {
+    if ((*timers_.begin())->next_ < nextEarliest) {
+      nextEarliest = (*timers_.begin())->next_;
+    }
+  }
+
+  earliestNext_.store(nextEarliest, std::memory_order_relaxed);
 }
 
 void TimerManager::listExpiredCb(std::vector<std::function<void()>> &cbs) {
   uint64_t now_ms = GetElapsedMS();
-  std::vector<Timer::ptr> expired;
-  {
-    RWMutex::ReadLock lock(mutex_);
-    if (timers_.empty()) {
-      return;
-    }
-  }
   RWMutex::WriteLock lock(mutex_);
-  if (timers_.empty()) {
-    return;
-  }
-  bool rollover = false;
-  if (detectClockRolllover(now_ms)) {
-    rollover = true;
-  }
-  if (!rollover && ((*timers_.begin())->next_ > now_ms)) {
-    return;
-  }
-
-  Timer::ptr now_timer(new Timer(now_ms));
-  auto it = rollover ? timers_.end() : timers_.lower_bound(now_timer);
-  while (it != timers_.end() && (*it)->next_ == now_ms) {
-    ++it;
-  }
-  expired.insert(expired.begin(), timers_.begin(), it);
-  timers_.erase(timers_.begin(), it);
-
-  cbs.reserve(expired.size());
-  for (auto &timer : expired) {
-    cbs.push_back(timer->cb_);
-    if (timer->recurring_) {
-      // 循环计时，重新加入堆中
-      timer->next_ = now_ms + timer->ms_;
-      timers_.insert(timer);
-    } else {
-      timer->cb_ = nullptr;
-    }
-  }
+  detectClockRolllover(now_ms);
+  advanceWheel(now_ms, cbs);
 }
 
 void TimerManager::addTimer(Timer::ptr val, RWMutex::WriteLock &lock) {
-  auto it = timers_.insert(val).first;
-  bool at_front = (it == timers_.begin()) && !tickled_;
-  if (at_front) {
+  bool at_front = val->next_ < earliestNext_.load(std::memory_order_relaxed);
+  insertToWheel(val);
+  if (at_front && !tickled_) {
     tickled_ = true;
-  }
-  lock.unlock();
-  if (at_front) {
+    lock.unlock();
     OnTimerInsertedAtFront();
+  } else {
+    lock.unlock();
   }
 }
 
@@ -138,3 +211,4 @@ bool TimerManager::detectClockRolllover(uint64_t now_ms) {
 }
 
 }  // namespace pulsar
+
