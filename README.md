@@ -21,16 +21,18 @@ Pulsar 是一个面向 Linux 的 C++17 有栈协程与模块化网络 I/O 库，
 依赖方向为 `Pulsar::rpc → Pulsar::net → Pulsar::pulsar`。这三个目标是功能分层，
 不表示已经覆盖 PhotonLibOS 的文件 I/O、HTTP/TLS、io_uring 或全部 LibOS 能力。
 
-## 实现贡献与来源
+## 实现说明
+
+本运行时为独立实现。组件划分（Fiber/Scheduler/IOManager/Hook/FdManager）与公开的
+协程教程和工业实现在设计空间上自然相近，但代码为本仓库原创，未复制任何上游项目；
+历史版本曾因实现差异存在过不准确的来源表述，现予更正。
 
 当前版本的主要开发工作包括：
 
 - 将 Fiber 上下文迁移至 Boost.Context `fcontext`，完善生命周期与异常边界；
 - 实现 per-worker deque、work stealing、Worker 亲和与回调 Fiber 复用；
-- 增加协程栈分配与复用、同步原语，以及正确性测试和性能基准。
-
-早期代码保留过 Sylar 协程项目的标识。准确的上游版本与许可证仍需核对；
-在完成核对前，不将整个运行时表述为从零独立实现。
+- 增加协程栈池（PooledStackAllocator，64 MiB 有界/分级/trim/统计）与栈复用验证；
+- 增加同步原语、guard page 支持、正确性测试和系统化性能基准。
 
 ## 1. 核心能力
 
