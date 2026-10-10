@@ -1,4 +1,4 @@
-# Pulsar
+﻿# Pulsar
 
 Pulsar 是一个面向 Linux 的 C++17 有栈协程与模块化网络 I/O 库，
 可选配 Protobuf RPC。
@@ -12,20 +12,16 @@ Pulsar 是一个面向 Linux 的 C++17 有栈协程与模块化网络 I/O 库，
 仍处于实验阶段。当前没有长期负载与跨发行版验证，不应直接作为生产级
 网络/RPC 运行时使用。
 
-| 模块 | CMake 目标 | 默认 | 当前范围 |
-| --- | --- | --- | --- |
-| Fiber、Scheduler、epoll/Timer、Hook | `Pulsar::pulsar` | 开启 | 已有核心接口 |
-| 显式非阻塞 TCP | `Pulsar::net` | 关闭 | IPv4 TCP、限流、超时与关闭 |
-| Protobuf RPC | `Pulsar::rpc` | 关闭 | 兼容 StrataKV RPC v1 的通用 Service/Channel |
+| 模块                                | CMake 目标         | 默认 | 当前范围                                    |
+| ----------------------------------- | ------------------ | ---- | ------------------------------------------- |
+| Fiber、Scheduler、epoll/Timer、Hook | `Pulsar::pulsar` | 开启 | 已有核心接口                                |
+| 显式非阻塞 TCP                      | `Pulsar::net`    | 关闭 | IPv4 TCP、限流、超时与关闭                  |
+| Protobuf RPC                        | `Pulsar::rpc`    | 关闭 | 兼容 StrataKV RPC v1 的通用 Service/Channel |
 
 依赖方向为 `Pulsar::rpc → Pulsar::net → Pulsar::pulsar`。这三个目标是功能分层，
 不表示已经覆盖 PhotonLibOS 的文件 I/O、HTTP/TLS、io_uring 或全部 LibOS 能力。
 
 ## 实现说明
-
-本运行时为独立实现。组件划分（Fiber/Scheduler/IOManager/Hook/FdManager）与公开的
-协程教程和工业实现在设计空间上自然相近，但代码为本仓库原创，未复制任何上游项目；
-历史版本曾因实现差异存在过不准确的来源表述，现予更正。
 
 当前版本的主要开发工作包括：
 
@@ -74,13 +70,13 @@ Application callback / synchronous-style I/O
 Pulsar 不依赖 Muduo、Protobuf 或 RocksDB；Fiber 上下文切换直接依赖
 Boost.Context：
 
-| 依赖 | CMake/系统名称 | 用途 |
-| --- | --- | --- |
-| C++ 标准库 | C++17 | 容器、智能指针、函数对象、原子变量和线程辅助类型 |
-| Boost.Context | `find_package(Boost COMPONENTS context)`、`Boost::context` | Fiber 的原生 `fcontext` 创建与切换 |
-| POSIX Threads | `find_package(Threads)`、`Threads::Threads` | Scheduler Worker、线程封装和同步基础设施 |
-| Dynamic Loader | `${CMAKE_DL_LIBS}`，Linux 通常为 `libdl` | 通过 `dlsym` 获取被 Hook 系统调用的原始入口 |
-| Linux libc/API | epoll、socket、timer、pipe、mmap/mprotect（可选） | I/O 多路复用、事件唤醒和 guard page |
+| 依赖           | CMake/系统名称                                                 | 用途                                             |
+| -------------- | -------------------------------------------------------------- | ------------------------------------------------ |
+| C++ 标准库     | C++17                                                          | 容器、智能指针、函数对象、原子变量和线程辅助类型 |
+| Boost.Context  | `find_package(Boost COMPONENTS context)`、`Boost::context` | Fiber 的原生`fcontext` 创建与切换              |
+| POSIX Threads  | `find_package(Threads)`、`Threads::Threads`                | Scheduler Worker、线程封装和同步基础设施         |
+| Dynamic Loader | `${CMAKE_DL_LIBS}`，Linux 通常为 `libdl`                   | 通过`dlsym` 获取被 Hook 系统调用的原始入口     |
+| Linux libc/API | epoll、socket、timer、pipe、mmap/mprotect（可选）              | I/O 多路复用、事件唤醒和 guard page              |
 
 构建需要 CMake 和 C++17 编译器；运行基准时，CPU 绑定命令 `taskset` 和环境
 采集命令 `lscpu` 来自 `util-linux`，属于可选测试工具。
@@ -128,14 +124,14 @@ build/pulsar-benchmark
 
 ### 2.3 构建选项
 
-| CMake 选项 | 默认值 | 作用 |
-| --- | --- | --- |
-| `PULSAR_BUILD_TESTS` | `ON` | 构建同步正确性测试 |
-| `PULSAR_BUILD_BENCHMARKS` | `ON` | 构建性能与压力基准 |
-| `PULSAR_BUILD_NET` | `OFF` | 构建并导出显式 TCP 目标 `Pulsar::net` |
-| `PULSAR_BUILD_RPC` | `OFF` | 构建并导出 `Pulsar::rpc`，同时开启 net；需要 Protobuf |
-| `PULSAR_FIBER_GUARD_PAGES` | `OFF` | 用 `mmap/mprotect` 在 Fiber 栈底加入 guard page |
-| `BUILD_TESTING` | `ON` | 控制 CTest 测试目标 |
+| CMake 选项                   | 默认值  | 作用                                                   |
+| ---------------------------- | ------- | ------------------------------------------------------ |
+| `PULSAR_BUILD_TESTS`       | `ON`  | 构建同步正确性测试                                     |
+| `PULSAR_BUILD_BENCHMARKS`  | `ON`  | 构建性能与压力基准                                     |
+| `PULSAR_BUILD_NET`         | `OFF` | 构建并导出显式 TCP 目标`Pulsar::net`                 |
+| `PULSAR_BUILD_RPC`         | `OFF` | 构建并导出`Pulsar::rpc`，同时开启 net；需要 Protobuf |
+| `PULSAR_FIBER_GUARD_PAGES` | `OFF` | 用`mmap/mprotect` 在 Fiber 栈底加入 guard page       |
+| `BUILD_TESTING`            | `ON`  | 控制 CTest 测试目标                                    |
 
 默认关闭 guard page 是为了保持迁移前后均使用 128 KiB、malloc/free 栈的公平
 A/B。服务部署更重视栈溢出 fail-fast 时可显式打开；该配置已经通过两项 CTest。
@@ -172,6 +168,7 @@ Hook 只在 Pulsar Scheduler Worker 中自动启用。在普通线程中调用�
 ### 3.2 协程栈分配器与对象池 (Stack Allocator & Object Cache)
 
 Pulsar 提供分层的协程栈分配管理机制：
+
 1. **`DirectStackAllocator`**：默认直通分配器，通过 `malloc/free`（或开启 Guard Page 时的 `mmap/munmap`）进行无池化即时分配与释放。
 2. **`PooledStackAllocator`**：线程安全的高性能栈复用池，按 2 的幂次分级管理空闲栈。
    - **默认容量上限**：`maxCachedBytes = 64 MiB`（67,108,864 字节）。
@@ -307,21 +304,20 @@ Mutex 的竞争、超时、取消和 Semaphore 唤醒。基准程序还会在各
 ./build/pulsar-benchmark --help
 ```
 
-| 场景 | 命令示例 | 测量内容 |
-| --- | --- | --- |
-| 上下文切换 | `--case context --iterations 5000000 --cpu 0` | Resume/Yield transfer |
-| 生命周期 | `--case lifecycle --count 10000 --cpu 0 --mode MODE` | 创建、首次运行、销毁和内存 |
-| 调度 | `--case scheduler --count 100000 --threads 1` | Callback 调度吞吐 |
-| 定时器 | `--case timer --count 10000 --delay-ms 50 --cpu 0` | 插入成本和到期延迟 |
-| Hook sleep | `--case hook-sleep --count 10000 --delay-ms 10 --cpu 0` | 定时挂起与恢复 |
-| Hook TCP echo | `--case hook-echo --count 1000 --round-trips 10` | Loopback socket Hook |
-| 同步压力 | `--case sync --count 1000 --threads 4` | Semaphore 与 Mutex |
-| 波次突发 | `--case wave-burst --rounds 5 --pool-mib 64` | 栈池冷热命中、驱逐与容量上限 |
-| 休眠足迹 | `--case sleep-footprint --count 10000 --pool-mib 64 --mode pool-single` | VmSize/RSS 与 checked-out/cached 字节记账 |
-| 回调 A/B | `--case callback-ab --mode pool-multi --rounds 5 --count 50000` | 单槽/多槽命中与外部别名拒绝 |
+| 场景          | 命令示例                                                                  | 测量内容                                  |
+| ------------- | ------------------------------------------------------------------------- | ----------------------------------------- |
+| 上下文切换    | `--case context --iterations 5000000 --cpu 0`                           | Resume/Yield transfer                     |
+| 生命周期      | `--case lifecycle --count 10000 --cpu 0 --mode MODE`                    | 创建、首次运行、销毁和内存                |
+| 调度          | `--case scheduler --count 100000 --threads 1`                           | Callback 调度吞吐                         |
+| 定时器        | `--case timer --count 10000 --delay-ms 50 --cpu 0`                      | 插入成本和到期延迟                        |
+| Hook sleep    | `--case hook-sleep --count 10000 --delay-ms 10 --cpu 0`                 | 定时挂起与恢复                            |
+| Hook TCP echo | `--case hook-echo --count 1000 --round-trips 10`                        | Loopback socket Hook                      |
+| 同步压力      | `--case sync --count 1000 --threads 4`                                  | Semaphore 与 Mutex                        |
+| 波次突发      | `--case wave-burst --rounds 5 --pool-mib 64`                            | 栈池冷热命中、驱逐与容量上限              |
+| 休眠足迹      | `--case sleep-footprint --count 10000 --pool-mib 64 --mode pool-single` | VmSize/RSS 与 checked-out/cached 字节记账 |
+| 回调 A/B      | `--case callback-ab --mode pool-multi --rounds 5 --count 50000`         | 单槽/多槽命中与外部别名拒绝               |
 
-生命周期、波次突发、休眠足迹和回调 A/B 支持 `--mode
-direct-single|pool-single|pool-multi`（默认 `direct-single`，即 Direct 分配器 +
+生命周期、波次突发、休眠足迹和回调 A/B 支持 `--mode direct-single|pool-single|pool-multi`（默认 `direct-single`，即 Direct 分配器 +
 每 Worker 单槽回调缓存的基线）；`--pool-mib` 设置栈池空闲上限（默认 64 MiB），
 `--fiber-cache-per-worker` 设置回调对象缓存容量。示例：固定 CPU 运行上下文切换基准：
 
@@ -348,12 +344,12 @@ taskset -c 0-3 ./build/pulsar-benchmark \
 4 个逻辑 CPU）、Ubuntu 22.04、GCC 11.4、Boost 1.74、Release、默认 128 KiB
 栈。每项预热后运行 5 轮，报告中位数：
 
-| 场景 | 负载 | 中位数 |
-| --- | --- | ---: |
-| Fiber 上下文切换 | 每轮 5,000,000 次 Yield | 28.543 ns/transfer |
-| 单 Worker callback 调度 | 100,000 task | 5.589 M task/s |
-| 四 Worker callback 调度 | 100,000 task | 16.985 M task/s，3.04× 单 Worker |
-| Loopback Hook echo | 1,000 连接 × 10 次 × 64 B | 56.072 K request/s，0 失败 |
+| 场景                    | 负载                        |                            中位数 |
+| ----------------------- | --------------------------- | --------------------------------: |
+| Fiber 上下文切换        | 每轮 5,000,000 次 Yield     |                28.543 ns/transfer |
+| 单 Worker callback 调度 | 100,000 task                |                    5.589 M task/s |
+| 四 Worker callback 调度 | 100,000 task                | 16.985 M task/s，3.04× 单 Worker |
+| Loopback Hook echo      | 1,000 连接 × 10 次 × 64 B |        56.072 K request/s，0 失败 |
 
 复现对应负载：
 
